@@ -12,7 +12,6 @@
 		E7B7C4EA2820B87F006DD7B4 /* usbgadget.cpp in Sources */ = {isa = PBXBuildFile; fileRef = E7B7C4E12820B87F006DD7B4 /* usbgadget.cpp */; };
 		E7B7C4EC2820B87F006DD7B4 /* usbgadget_userclient.h in Headers */ = {isa = PBXBuildFile; fileRef = E7B7C4E32820B87F006DD7B4 /* usbgadget_userclient.h */; };
 		E7B7C4ED2820B87F006DD7B4 /* usbgadget_types.h in Headers */ = {isa = PBXBuildFile; fileRef = E7B7C4E42820B87F006DD7B4 /* usbgadget_types.h */; };
-		E7B7C4EE2820B87F006DD7B4 /* Info.plist in Resources */ = {isa = PBXBuildFile; fileRef = E7B7C4E52820B87F006DD7B4 /* Info.plist */; };
 		E7B7C4EF2820B87F006DD7B4 /* usbgadget.h in Headers */ = {isa = PBXBuildFile; fileRef = E7B7C4E62820B87F006DD7B4 /* usbgadget.h */; };
 /* End PBXBuildFile section */
 
@@ -163,7 +162,6 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				E7B7C4EE2820B87F006DD7B4 /* Info.plist in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -216,7 +214,7 @@
 				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
 				GCC_WARN_UNUSED_FUNCTION = YES;
 				GCC_WARN_UNUSED_VARIABLE = YES;
-				MACOSX_DEPLOYMENT_TARGET = 10.11;
+				MACOSX_DEPLOYMENT_TARGET = 12.0;
 				MTL_ENABLE_DEBUG_INFO = YES;
 				ONLY_ACTIVE_ARCH = YES;
 				SDKROOT = macosx;
@@ -251,7 +249,7 @@
 				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
 				GCC_WARN_UNUSED_FUNCTION = YES;
 				GCC_WARN_UNUSED_VARIABLE = YES;
-				MACOSX_DEPLOYMENT_TARGET = 10.11;
+				MACOSX_DEPLOYMENT_TARGET = 12.0;
 				MTL_ENABLE_DEBUG_INFO = NO;
 				SDKROOT = macosx;
 			};

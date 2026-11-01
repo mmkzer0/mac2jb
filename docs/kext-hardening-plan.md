@@ -39,6 +39,13 @@ Verified on this machine and from Apple primary sources:
   A probe build succeeded in 2.4 s after two overrides:
   `ARCHS=arm64e ONLY_ACTIVE_ARCH=YES MACOSX_DEPLOYMENT_TARGET=12.0`.
   The project's own `MACOSX_DEPLOYMENT_TARGET = 10.11` is rejected by Xcode 27.
+- Configuration evidence: a Debug (`-O0`) build of the vendored project under
+  Xcode 27.2 produces `__TEXT_EXEC,__text` = 6824 bytes and 428 disassembly
+  lines, and its defined-symbol surface matches the shipped binary except four
+  header-emitted symbols. The shipped binary (`__text` = 6764 bytes, 424 lines)
+  therefore matches a Debug build, not the Release build (`__text` = 5220 bytes,
+  328 lines). This explains the size difference without assuming a source
+  divergence.
 - `MacOSX27.2.sdk/System/Library/Frameworks/Kernel.framework/Headers/IOKit/…`
   provides the kernel headers, so no KDK is needed to **build** the kext.
 - A KDK **is** required to rebuild kernel collections on macOS 13 and later:
@@ -186,8 +193,11 @@ Deliverables:
     files under `vendor/macos_usb_gadget_poc/usbgadget`, toolchain and host,
     artifact hashes, signing state),
   - `report` prints a deterministic Markdown comparison against
-    `drivers/usbgadget.kext` (size, signing, Mach-O arch, undefined symbols,
-    sections, ObjC metadata, strings).
+    `drivers/usbgadget.kext` (size, signing, Mach-O arch, undefined and defined
+    symbols, sections, meaningful strings of at least 8 bytes).
+- The report also explains the configuration difference: the shipped binary
+  matches a Debug (`-O0`) build of the same source under the current toolchain,
+  while the S0 artifact is a Release build (§2, `docs/kext-provenance.md`).
 - `docs/kext-provenance.md`: captured output of `report`, with the explicit
   statement that byte-identical reproduction is **not** claimed
   (shipped: Xcode 2660 / SDK 26.5; ours: Xcode 27.2 / SDK 27.2).

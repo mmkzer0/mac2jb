@@ -15,6 +15,10 @@ source files. Root `LICENSE` does not override third-party terms.
   provenance README and APSL text. The unused `usb_device/` proof of concept,
   upstream convenience shell scripts, prebuilt `usbgadget.kext/`, and machine-local
   Xcode user settings are excluded. This is not a byte-for-byte upstream tree.
+  2026-11-01 downstream change: MACOSX_DEPLOYMENT_TARGET was raised from 10.11
+  to 12.0 (Xcode 27 rejects older targets) and the Info.plist Copy Bundle
+  Resources entry was removed so the bundle keeps exactly Contents/Info.plist;
+  upstream.lock still records the upstream origin revision.
 - ns2jb: the `BermTheSequel/ns2jb2` fork, based on pepsipu's
   original project, replaces the previous runtime. Its complete snapshot and
   tests are pinned in `upstream.lock`. All runtime, exploit, and test files are
