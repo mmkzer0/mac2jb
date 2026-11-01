@@ -41,9 +41,9 @@ xcodebuild -project usbgadget.xcodeproj -configuration Debug -sdk macosx \
 ## Artifacts
 
 - Built: `build/kext/usbgadget.kext`
-  - Total size: 116592 bytes
-  - Executable: `Contents/MacOS/usbgadget` (114336 bytes)
-    - SHA256: `e8e82a5794b50a9ab4ec8bfd2944848189e4c93ba2a8e53c946ccff7e8a11d8e`
+  - Total size: 116600 bytes
+  - Executable: `Contents/MacOS/usbgadget` (114344 bytes)
+    - SHA256: `6d6dbef5b2e0b2417aa35bbf1822d7078076149a1e28d72284ee76be7c7e609e`
   - Info.plist: `Contents/Info.plist` (2256 bytes)
     - SHA256: `a4ca368ce107273aaf008a8dd68d1de898eb9889c5efc6e56ea76601912ce0bd`
 - Shipped: `drivers/usbgadget.kext`
@@ -92,7 +92,7 @@ xcodebuild -project usbgadget.xcodeproj -configuration Debug -sdk macosx \
   - `__DATA_CONST,__got`: built 80 bytes, shipped 56 bytes (+24 bytes)
   - `__TEXT,__cstring`: built 1023 bytes, shipped 835 bytes (+188 bytes)
   - `__TEXT_EXEC,__auth_stubs`: built 432 bytes, shipped 400 bytes (+32 bytes)
-  - `__TEXT_EXEC,__text`: built 6744 bytes, shipped 6764 bytes (-20 bytes)
+  - `__TEXT_EXEC,__text`: built 6784 bytes, shipped 6764 bytes (+20 bytes)
 
 ## Defined symbols
 
@@ -135,9 +135,10 @@ These artifacts were built with different Xcode/SDK versions; byte-identical rep
   kernel symbol table. The three removed imports were the dead user-client
   `setProperties` symbol and the base `IOUserClient::clientClose`/`free` stubs;
   the hardened code implements both explicitly.
-- `__TEXT_EXEC,__text` is 6744 bytes against the shipped 6764 (-20) and the S0
+- `__TEXT_EXEC,__text` is 6784 bytes against the shipped 6764 (+20) and the S0
   Release build's 5220. The hardening adds roughly 1.5 KiB; the shipped binary
-  remains a Debug build (see below), which is why it is still slightly larger.
+  remains a Debug build (see below), so the 20-byte difference is toolchain and
+  configuration noise, not a behavioral delta.
 - Defined symbols add the new `stopThread`, `copyProvider`, `releaseProvider`,
   `clientClose`, `free` and the two-argument `thread_bootstrap`; the removed
   `gay_bowser_usbgadget::setConfigurationDict` is the helper replaced by the

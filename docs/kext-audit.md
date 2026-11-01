@@ -27,7 +27,7 @@ IOKit boundary in user space and cannot replace the S3 hardware gate.
 | F11 | `usbgadget.cpp` `start`/`stop` | Medium | `registerService` ran before provider validation; provider was not retained | fixed: validate, retain, then register; release in `stop`/`free` |
 | F12 | `usbgadget.cpp` `setProperties` | Low | A non-dictionary `PublishConfiguration` value was silently ignored | fixed: returns `kIOReturnBadArgument` |
 | F13 | `usbgadget.cpp` `init` | Medium | A failed `kernel_thread_start` was logged but init returned success, so a workerless service registered and Poke reported success | fixed: init frees the lock, returns false, and `free` remains safe after the partial init |
-| F14 | `usbgadget.cpp` `doUpdate` | Medium | The provider callback ran under `m_pokeLock`; a synchronous reentrant callback would self-deadlock, and a slow callback serialized pokes | fixed: retain configuration/provider snapshots, consume the pending update, drop the lock for the callback, and keep a callback poke pending; test 7b |
+| F14 | `usbgadget.cpp` `doUpdate` | Medium | The provider callback ran under `m_pokeLock`; a synchronous reentrant callback would self-deadlock, and a slow callback serialized pokes | fixed: retain configuration/provider snapshots, drop the lock for the callback, and clear the pending flag only when the poke serial is unchanged; test 7b |
 | F15 | `usbgadget.cpp` `setProperties` | Medium | Unknown keys were ignored, `Poke` accepted any value type, and a failed `setProperty` was reported as success after the configuration had already changed | fixed: validate the entire dictionary, require the host's `OSString` Poke value, publish before committing, and leave state unchanged on failure; test 1 |
 
 ## Teardown protocol after the fix
@@ -35,11 +35,13 @@ IOKit boundary in user space and cannot replace the S3 hardware gate.
 - Service start: validate provider, retain, assign under `m_pokeLock`, then
   `super::start`, then `registerService`. Failure releases and nulls.
 - Worker: started once in `init`; when an update is pending it snapshots the
-  configuration and controller under `m_pokeLock`, retains both, clears the
-  pending flag, drops the lock, and calls the provider. A poke during that call
-  sets the flag again and is processed on the next pass; a callback poke is
-  therefore not lost. The worker sleeps only outside the lock; on exit it sets
-  `m_threadDone` and wakes all waiters.
+  configuration, controller and poke serial under `m_pokeLock`, retains both,
+  drops the lock, and calls the provider. After the callback it clears the
+  pending flag only if no new poke arrived (serial unchanged); otherwise the
+  flag stays set and the next pass applies it. A callback poke is therefore not
+  lost, and `!m_needsUpdate` is a real completion signal for the harness. The
+  worker sleeps only outside the lock; on exit it sets `m_threadDone` and wakes
+  all waiters.
 - `stopThread` (used by `stop` and `free`): sets exit and `m_needsUpdate` under
   the lock, waits on `m_threadDone` via `IOLockSleep` (lock released while
   asleep), takes `m_thread` under the lock and nulls it, then deallocates the
@@ -74,7 +76,7 @@ policy and record the residual local-process Poke capability.
   pass for both translation units.
 - `scripts/build-kext.sh`: Release build, arm64e, exactly
   `Contents/Info.plist` and `Contents/MacOS/usbgadget`, unsigned.
-  Current executable SHA-256 `e8e82a5794b50a9ab4ec8bfd2944848189e4c93ba2a8e53c946ccff7e8a11d8e`.
+  Current executable SHA-256 `6d6dbef5b2e0b2417aa35bbf1822d7078076149a1e28d72284ee76be7c7e609e`.
 - `nm -u`: no undefined symbol from this kext's own classes. The new kernel
   imports (`IOLockSleep`, `IOLockWakeup`, `IORegistryEntry::setProperties`,
   `OSString::metaClass`, `OSSymbol::metaClass`, `IOService::metaClass`) exist in
@@ -88,7 +90,8 @@ policy and record the residual local-process Poke capability.
   100 stop/stopThread/poke races; user-client init/start/stop/clientClose/free
   orderings, poke-vs-close (200 iterations), not-ready dispatch; stop waits for
   an in-flight controller call while a poke completes; synchronous controller
-  reentrancy without deadlock or a lost update; general one-shot and sticky
+  reentrancy without deadlock or a lost update; serial-checked update completion
+  (the sweep's settled wait is race-free); general one-shot and sticky
   fault sweeps over every tracked allocation, `IOLockAlloc`,
   `kernel_thread_start` and provider `setProperties` for both teardown
   variants; a 256-entry operation trace dumped on failure; worker-after-

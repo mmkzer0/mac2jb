@@ -109,6 +109,7 @@ void gay_bowser_usbgadget::triggerUpdate()
     //m_commandGate->runCommand(NULL);
     IOLockLock(m_pokeLock);
     m_needsUpdate = true;
+    ++m_updateSerial;
     IOLockUnlock(m_pokeLock);
 }
 
@@ -129,17 +130,19 @@ void gay_bowser_usbgadget::doUpdate()
     if (configuration) configuration->retain();
     controller = m_controller_provider;
     if (controller) controller->retain();
-    // Consume the pending update before the external call so a poke that arrives
-    // during the callback remains pending. With no controller yet, keep it
-    // pending until start() provides one.
-    if (!configuration || controller) {
+    unsigned long serial = m_updateSerial;
+    if (!configuration) {
+        // A poke with no configuration has nothing to apply.
         m_needsUpdate = false;
+        IOLockUnlock(m_pokeLock);
+        if (controller) controller->release();
+        return;
     }
     IOLockUnlock(m_pokeLock);
 
-    if (!configuration || !controller) {
-        if (controller) controller->release();
-        if (configuration) configuration->release();
+    if (!controller) {
+        // Keep the pending update until start() provides a controller.
+        configuration->release();
         return;
     }
 
@@ -154,6 +157,14 @@ void gay_bowser_usbgadget::doUpdate()
             LogD("Controller setProperties failed in 'gay_bowser_usbgadget:doUpdate()' (0x%x).", result);
         }
     }
+
+    // Clear the pending flag only if no poke arrived during the callback. A
+    // poke during the call keeps the flag set and is processed next.
+    IOLockLock(m_pokeLock);
+    if (m_exitThreads || m_updateSerial == serial) {
+        m_needsUpdate = false;
+    }
+    IOLockUnlock(m_pokeLock);
 
     if (pCommandDict) pCommandDict->release();
     controller->release();
@@ -239,6 +250,7 @@ bool gay_bowser_usbgadget::init(OSDictionary *dictionary) {
     m_thread = THREAD_NULL;
     m_threadDone = false;
     m_needsUpdate = false;
+    m_updateSerial = 0;
     m_exitThreads = false;
     
     if (!super::init(dictionary)) {

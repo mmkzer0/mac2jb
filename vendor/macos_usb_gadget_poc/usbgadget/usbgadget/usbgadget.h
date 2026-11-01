@@ -52,6 +52,7 @@ private:
     IOService *m_controller_provider;
     IOLock *m_pokeLock;
     bool m_needsUpdate;
+    unsigned long m_updateSerial;
     bool m_exitThreads;
     thread_t m_thread;
     bool m_threadDone;

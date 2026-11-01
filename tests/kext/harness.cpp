@@ -921,27 +921,27 @@ void test_stop_waits_for_controller() {
 void test_controller_reentrancy() {
     FakeController *c = new FakeController;
     gay_bowser_usbgadget *g = new_gadget();
-    gay_bowser_usbgadget_userclient *uc = new_userclient();
     OSDictionary *cfg = make_config("reentrant");
     OSDictionary *props = make_props("PublishConfiguration", cfg);
     CHECK(g->setProperties(props) == kIOReturnSuccess);
     CHECK(g->start(c));
-    CHECK(uc->start(g));
 
     std::atomic<int> reentered(0);
     c->on_set_properties = [&] {
         if (reentered.fetch_add(1) == 0) g->triggerUpdate();
     };
 
-    CHECK(poke(uc) == kIOReturnSuccess);
+    // This is the unprivileged host path: PublishConfiguration, then a Poke
+    // property write, with no user-client round trip.
+    OSDictionary *poke_props = make_poke_props();
+    CHECK(g->setProperties(poke_props) == kIOReturnSuccess);
     CHECK(wait_until([&] { return c->calls.load() >= 2; }, 3000));
     CHECK(reentered.load() >= 1);
     CHECK(g_stats.violations.load() == 0);
     CHECK(g->m_thread != THREAD_NULL);
 
-    uc->clientClose();
     g->stop(c);
-    uc->release();
+    poke_props->release();
     g->release();
     c->release();
     props->release();

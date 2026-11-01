@@ -123,7 +123,7 @@ Sources:
 
 - Harness: 21 tests, pass under ASan+UBSan and TSan (~5.75 s).
 - Strict source gate: pass.
-- Final artifact: 114336 bytes, SHA-256
-  `e8e82a5794b50a9ab4ec8bfd2944848189e4c93ba2a8e53c946ccff7e8a11d8e`.
+- Final artifact: 114344 bytes, SHA-256
+  `6d6dbef5b2e0b2417aa35bbf1822d7078076149a1e28d72284ee76be7c7e609e`.
 - Not yet: iterator-creation and second-`getNextObject` sweep sites, tagged
   registry, two-tier self-check, coverage, mutation, TLA+ model.
