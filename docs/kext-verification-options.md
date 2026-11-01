@@ -15,6 +15,16 @@ Sources:
   shape).** The harness iterates the Nth allocation until a trial injects no
   failure, asserts the expected `kIOReturnNoMemory`, unchanged configuration and
   no leaks. Implemented in harness test `2_set_properties_oom`.
+- **General shim-operation failure sweep.** Iterate the Nth tracked allocation,
+  `IOLockAlloc`, `kernel_thread_start` and provider `setProperties` in one-shot
+  and sticky modes, for both teardown variants; stop at the first N that injects
+  nothing and require a minimum number of reached sites. Implemented in harness
+  tests `8a`–`8h`; iterator creation and the second `getNextObject` remain
+  uncovered.
+- **Operation trace with teardown and lock assertions.** A 256-entry ring dumps
+  the last 32 shim calls on failure; a worker call after `stop()`/`free()`
+  returns, a running worker, unbalanced lock/unlock, and a use-after-free lock
+  are violations. `IOSleepWithLeeway` and lock operations use a seeded jitter.
 - **Lifecycle permutations with a live-object baseline.** Every ordering of
   start/stop/stopThread/free and the user-client orderings must return the
   object/lock/thread counters to baseline. This is the SQLite post-run
@@ -30,16 +40,9 @@ Sources:
 
 ## Adopted next (not implemented in S1)
 
-- **General shim-operation failure sweep.** Generalise the existing
-  allocation-only sweep to every intercepted operation: `IOLockAlloc`, thread
-  start, provider `setProperties`, iterator creation, and the second
-  `getNextObject`. Run each N in one-shot and sticky modes, seeded, and stop at
-  the first N that injects nothing. This is the SQLite `do_ioerr_test` shape and
-  the largest remaining coverage gap.
-- **Operation trace with teardown assertions.** Fixed ring of `{seq, op,
-  result}` in the shim, dumped on failure; assert no intercepted call after
-  `stop()`/`free()` returns and no lock freed while held (the shim already
-  reports the latter). Mirrors SQLite `test_osinst.c`/`ext/misc/vfslog.c`.
+- **Sweep extension for iterator operations.** Add `OSCollectionIterator`
+  creation and the second `getNextObject` to the general sweep; the S1 sweep
+  covers allocation, `IOLockAlloc`, thread start and provider `setProperties`.
 - **Tagged live-object registry.** Attach `__FILE__:__LINE__` to every tracked
   `OSObject`/`IOLock` so a baseline diff names the leaking site, not just the
   count. SQLite `src/mem2.c` guards/titles are the model.
@@ -113,9 +116,9 @@ Sources:
 
 ## Verification status
 
-- Harness: 12 tests, pass under ASan+UBSan and TSan.
+- Harness: 20 tests, pass under ASan+UBSan and TSan (~5.7 s).
 - Strict source gate: pass.
 - Final artifact: 114400 bytes, SHA-256
   `41f650949afcecf9bd730212d55a2ee3254c7c748962d5ebb2d81e86ed8546cf`.
-- Not yet: general operation sweep, trace assertions, tagged registry, coverage,
-  mutation, TLA+ model.
+- Not yet: iterator-creation and second-`getNextObject` sweep sites, tagged
+  registry, two-tier self-check, coverage, mutation, TLA+ model.

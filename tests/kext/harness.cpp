@@ -52,7 +52,7 @@ void check_failed(int line, const char *what) {
 }
 
 void check_failedf(int line, const char *fmt, ...) {
-    char buf[512];
+    char buf[1024];
     va_list ap;
     va_start(ap, fmt);
     vsnprintf(buf, sizeof(buf), fmt, ap);
@@ -108,7 +108,7 @@ class FakeController : public IOService {
             entered = true;
             wait_until([this] { return gate_open.load(); }, 3000);
         }
-        return kIOReturnSuccess;
+        return IOService::setProperties(props);
     }
 
     std::string command() {
@@ -897,6 +897,286 @@ void test_stop_while_poke_holds_lock() {
 }
 
 // ---------------------------------------------------------------------------
+// Failure sweeps: arm a failure at the nth shim-mediated operation of one kind, for n = 1, 2, ... until a run
+// injects nothing, once one-shot (fail once) and once sticky (fail that and every later operation).
+// Every trial replays the same fixed scenario in a freshly reset shim world with a trial-specific RNG seed.
+// ---------------------------------------------------------------------------
+
+uint64_t base_seed() {
+    static const uint64_t seed = []() -> uint64_t {
+        const char *env = getenv("KEXT_HARNESS_SEED");
+        if (env && *env) return static_cast<uint64_t>(strtoull(env, NULL, 0));
+        return 20240601u;
+    }();
+    return seed;
+}
+
+enum SweepStep {
+    kStepInit = 1,
+    kStepSetProps,
+    kStepStart,
+    kStepUcInit,
+    kStepUcStart,
+    kStepWork,
+    kStepTeardown
+};
+
+enum Teardown { kTeardownStopFree, kTeardownFreeOnly };
+
+struct SweepFixtures {
+    OSDictionary *cfg;
+    OSDictionary *publish;
+};
+
+struct ScenarioResult {
+    ScenarioResult()
+        : init_ok(false),
+          worker_present(false),
+          setprops_rc(kIOReturnSuccess),
+          config_set(false),
+          start_ok(false),
+          uc_init_ok(false),
+          uc_start_ok(false),
+          poke_rc(kIOReturnSuccess),
+          settled(true),
+          ctrl_calls(0),
+          thread_left_after_stop(false) {}
+    bool init_ok;
+    bool worker_present;
+    IOReturn setprops_rc;
+    bool config_set;
+    bool start_ok;
+    bool uc_init_ok;
+    bool uc_start_ok;
+    IOReturn poke_rc;
+    bool settled;
+    int ctrl_calls;
+    bool thread_left_after_stop;
+};
+
+// Fixed scenario: gadget init -> publish config -> start -> user client init/start -> poke (worker pushes the
+// configuration into the controller) -> teardown. Only kext code performs shim-mediated operations in here, so
+// the per-operation sequence numbers are the same on every run.
+void run_scenario(Teardown td, const SweepFixtures &f, ScenarioResult &r) {
+    set_step(kStepInit);
+    FakeController *c = new FakeController;
+    gay_bowser_usbgadget *g = new gay_bowser_usbgadget;
+    r.init_ok = g->init(NULL);
+    if (!r.init_ok) {
+        g->release();
+        c->release();
+        mark_quiescent();
+        return;
+    }
+    r.worker_present = g->m_thread != THREAD_NULL;
+
+    set_step(kStepSetProps);
+    r.setprops_rc = g->setProperties(f.publish);
+    r.config_set = g->m_configuration != NULL;
+
+    set_step(kStepStart);
+    r.start_ok = g->start(c);
+
+    set_step(kStepUcInit);
+    gay_bowser_usbgadget_userclient *uc = new gay_bowser_usbgadget_userclient;
+    r.uc_init_ok = uc->initWithTask(reinterpret_cast<task_t>(static_cast<uintptr_t>(1)), NULL, 0, NULL);
+    if (r.uc_init_ok) {
+        set_step(kStepUcStart);
+        r.uc_start_ok = uc->start(g);
+    }
+
+    set_step(kStepWork);
+    if (r.uc_start_ok) {
+        r.poke_rc = poke(uc);
+    } else {
+        g->triggerUpdate();
+    }
+    if (r.worker_present) {
+        // The worker clears m_needsUpdate once it has finished (or skipped) the update.
+        r.settled = wait_until(
+            [g] {
+                IOLockLock(g->m_pokeLock);
+                bool done = !g->m_needsUpdate;
+                IOLockUnlock(g->m_pokeLock);
+                return done;
+            },
+            3000);
+    }
+    r.ctrl_calls = c->calls.load();
+
+    set_step(kStepTeardown);
+    if (td == kTeardownStopFree) {
+        uc->clientClose();
+        g->stop(c);
+        r.thread_left_after_stop = g->m_thread != THREAD_NULL;
+        mark_quiescent();
+        uc->release();
+        g->release();
+    } else {
+        uc->release();
+        g->release();
+        mark_quiescent();
+    }
+    c->release();
+}
+
+// An injection affects `step` if it fired during that step, or (sticky) during an earlier one.
+bool injection_active(bool fired, bool sticky, int fired_step, int step) {
+    return fired && (fired_step == step || (sticky && fired_step < step));
+}
+
+// Declared acceptable outcomes. Returns false and fills `why` when the scenario result is not one of them.
+bool classify(Op op, bool sticky, bool fired, int fired_step, const ScenarioResult &r, char *why, size_t why_len) {
+#define EXPECT(cond, ...)                      \
+    do {                                       \
+        if (!(cond)) {                         \
+            snprintf(why, why_len, __VA_ARGS__); \
+            return false;                      \
+        }                                      \
+    } while (0)
+
+    const bool alloc_like = op == kOpAlloc || op == kOpLockAlloc;
+    if (fired) {
+        const bool step_ok = op == kOpSetProperties ? fired_step == kStepWork
+                             : op == kOpThreadStart ? fired_step == kStepInit
+                                                    : fired_step >= kStepInit && fired_step <= kStepWork;
+        EXPECT(step_ok, "injection fired in unexpected step %d", fired_step);
+    }
+    EXPECT(r.settled, "worker never finished the pending update");
+
+    // gadget init: every allocation site (properties dictionary, lock) must fail init; thread start must not.
+    const bool init_must_fail = alloc_like && injection_active(fired, sticky, fired_step, kStepInit);
+    EXPECT(r.init_ok == !init_must_fail, "init returned %d, expected %d", r.init_ok, !init_must_fail);
+    if (!r.init_ok) return true;
+    const bool no_worker = op == kOpThreadStart && injection_active(fired, sticky, fired_step, kStepInit);
+    EXPECT(r.worker_present == !no_worker, "worker_present=%d, expected %d", r.worker_present, !no_worker);
+
+    // setProperties: every allocation site must surface kIOReturnNoMemory and must not store the configuration.
+    const bool props_must_fail = op == kOpAlloc && injection_active(fired, sticky, fired_step, kStepSetProps);
+    const IOReturn want_rc = props_must_fail ? kIOReturnNoMemory : kIOReturnSuccess;
+    EXPECT(r.setprops_rc == want_rc, "setProperties returned 0x%x, expected 0x%x", r.setprops_rc, want_rc);
+    EXPECT(r.config_set == !props_must_fail, "config_set=%d, expected %d", r.config_set, !props_must_fail);
+
+    EXPECT(r.start_ok, "gadget start() failed although it performs no shim-mediated operation that can fail");
+
+    const bool uc_must_fail = alloc_like && injection_active(fired, sticky, fired_step, kStepUcInit);
+    EXPECT(r.uc_init_ok == !uc_must_fail, "user client init returned %d, expected %d", r.uc_init_ok, !uc_must_fail);
+    if (r.uc_init_ok) {
+        EXPECT(r.uc_start_ok, "user client start() failed");
+        EXPECT(r.poke_rc == kIOReturnSuccess, "poke returned 0x%x", r.poke_rc);
+    }
+
+    // The worker pushes the configuration to the controller exactly once unless an allocation failure
+    // makes it skip the update; a failing controller call (kOpSetProperties) is still one call.
+    const bool update_skipped = op == kOpAlloc && injection_active(fired, sticky, fired_step, kStepWork);
+    const int want_calls = (r.worker_present && r.config_set && !update_skipped) ? 1 : 0;
+    EXPECT(r.ctrl_calls == want_calls, "controller saw %d update(s), expected %d", r.ctrl_calls, want_calls);
+    EXPECT(!r.thread_left_after_stop, "stop() returned with the worker thread still registered");
+    return true;
+#undef EXPECT
+}
+
+// One trial. Returns false (with `why`) when the outcome or the post-trial accounting is wrong.
+bool run_trial(Teardown td, Op op, unsigned long n, bool sticky, uint64_t seed, bool *fired_out, char *why,
+               size_t why_len) {
+    reset();
+    seed_rng(seed);
+    // Fixtures are built before arming so the harness's own allocations can never be injected.
+    SweepFixtures f;
+    f.cfg = make_config("sweep");
+    f.publish = make_props("PublishConfiguration", f.cfg);
+    const long live_base = g_stats.live_objects.load();
+    const long locks_base = g_stats.live_locks.load();
+    const long held_base = g_stats.locks_held.load();
+
+    arm_op_failure(op, n, sticky);
+    ScenarioResult r;
+    run_scenario(td, f, r);
+    const bool fired = op_failure_fired(op);
+    const int fired_step = op_failure_step(op);
+    disarm_op_failures();
+    *fired_out = fired;
+
+    bool ok = classify(op, sticky, fired, fired_step, r, why, why_len);
+    if (ok) {
+        if (g_stats.violations.load() != 0) {
+            snprintf(why, why_len, "%ld shim violation(s) (see SHIM VIOLATION lines above)", g_stats.violations.load());
+            ok = false;
+        } else if (g_stats.post_teardown_ops.load() != 0) {
+            snprintf(why, why_len, "%ld shim call(s) from the worker after stop()/free() returned",
+                     g_stats.post_teardown_ops.load());
+            ok = false;
+        } else if (g_stats.live_objects.load() != live_base) {
+            snprintf(why, why_len, "leaked %ld object(s)", g_stats.live_objects.load() - live_base);
+            ok = false;
+        } else if (g_stats.live_locks.load() != locks_base) {
+            snprintf(why, why_len, "leaked %ld lock(s)", g_stats.live_locks.load() - locks_base);
+            ok = false;
+        } else if (g_stats.locks_held.load() != held_base) {
+            snprintf(why, why_len, "%ld lock(s) still held at teardown", g_stats.locks_held.load() - held_base);
+            ok = false;
+        } else if (g_stats.workers_running.load() != 0) {
+            snprintf(why, why_len, "%ld worker(s) still running", g_stats.workers_running.load());
+            ok = false;
+        } else if (g_stats.threads_started.load() != g_stats.thread_deallocs.load()) {
+            snprintf(why, why_len, "started %ld thread(s), reaped %ld", g_stats.threads_started.load(),
+                     g_stats.thread_deallocs.load());
+            ok = false;
+        }
+    }
+
+    f.publish->release();
+    f.cfg->release();
+    return ok;
+}
+
+bool g_trace_dumped = false;
+
+void run_sweep(const char *scenario, Teardown td, Op op, int min_sites) {
+    const uint64_t base = base_seed();
+    int trials = 0;
+    for (int mode = 0; mode < 2; ++mode) {
+        const bool sticky = mode == 1;
+        int fired_trials = 0;
+        bool terminated = false;
+        for (unsigned long n = 1; n <= 128; ++n) {
+            const uint64_t seed = base ^ (0x9e3779b97f4a7c15ull * static_cast<uint64_t>(trials + 1));
+            char why[256] = "";
+            bool fired = false;
+            const bool ok = run_trial(td, op, n, sticky, seed, &fired, why, sizeof(why));
+            ++trials;
+            if (fired) ++fired_trials;
+            if (!ok) {
+                check_failedf(__LINE__,
+                              "sweep %s/%s %s n=%lu: %s [base_seed=%llu trial_seed=%llu; rerun with KEXT_HARNESS_SEED=%llu]",
+                              scenario, op_name(op), sticky ? "sticky" : "one-shot", n, why,
+                              static_cast<unsigned long long>(base), static_cast<unsigned long long>(seed),
+                              static_cast<unsigned long long>(base));
+                if (!g_trace_dumped) {
+                    g_trace_dumped = true;
+                    dump_trace(stderr, 32);
+                }
+            }
+            if (!fired) {
+                terminated = true;
+                break;
+            }
+        }
+        CHECKF(terminated, "sweep %s/%s %s: still injecting at n=128 (seed=%llu)", scenario, op_name(op),
+               sticky ? "sticky" : "one-shot", static_cast<unsigned long long>(base));
+        CHECKF(fired_trials >= min_sites, "sweep %s/%s %s: only %d injection site(s) reached (expected >= %d)", scenario,
+               op_name(op), sticky ? "sticky" : "one-shot", fired_trials, min_sites);
+    }
+    printf("sweep %s/%s: %d trials (seed=%llu)\n", scenario, op_name(op), trials, static_cast<unsigned long long>(base));
+    fflush(stdout);
+}
+
+template <Teardown TD, Op OP, int MIN_SITES>
+void test_sweep() {
+    run_sweep(TD == kTeardownStopFree ? "stop_free" : "free_only", TD, OP, MIN_SITES);
+}
+
+// ---------------------------------------------------------------------------
 // Runner: each test in a forked child under a watchdog
 // ---------------------------------------------------------------------------
 
@@ -918,22 +1198,38 @@ const TestCase kTests[] = {
     {"6d_userclient_orderings", test_userclient_orderings},
     {"6e_userclient_poke_vs_close", test_userclient_poke_vs_close},
     {"7_stop_while_poke_holds_lock", test_stop_while_poke_holds_lock},
+    {"8a_sweep_stop_free_alloc", test_sweep<kTeardownStopFree, kOpAlloc, 10>},
+    {"8b_sweep_stop_free_lock_alloc", test_sweep<kTeardownStopFree, kOpLockAlloc, 2>},
+    {"8c_sweep_stop_free_thread_start", test_sweep<kTeardownStopFree, kOpThreadStart, 1>},
+    {"8d_sweep_stop_free_set_properties", test_sweep<kTeardownStopFree, kOpSetProperties, 1>},
+    {"8e_sweep_free_only_alloc", test_sweep<kTeardownFreeOnly, kOpAlloc, 10>},
+    {"8f_sweep_free_only_lock_alloc", test_sweep<kTeardownFreeOnly, kOpLockAlloc, 2>},
+    {"8g_sweep_free_only_thread_start", test_sweep<kTeardownFreeOnly, kOpThreadStart, 1>},
+    {"8h_sweep_free_only_set_properties", test_sweep<kTeardownFreeOnly, kOpSetProperties, 1>},
 };
 
 void run_child(const TestCase &t) {
     reset();
+    seed_rng(base_seed());
     g_failed_checks = 0;
     long live_baseline = g_stats.live_objects.load();
 
     t.fn();
 
     CHECKF(g_stats.violations.load() == 0, "%ld shim violation(s) reported", g_stats.violations.load());
+    CHECKF(g_stats.post_teardown_ops.load() == 0, "%ld shim call(s) from a worker after teardown",
+           g_stats.post_teardown_ops.load());
     CHECKF(g_stats.live_objects.load() == live_baseline, "leaked %ld object(s)", g_stats.live_objects.load() - live_baseline);
     CHECKF(g_stats.live_locks.load() == 0, "leaked %ld lock(s)", g_stats.live_locks.load());
+    CHECKF(g_stats.locks_held.load() == 0, "%ld lock(s) still held at teardown", g_stats.locks_held.load());
     CHECKF(g_stats.threads_started.load() == g_stats.thread_deallocs.load(), "started %ld thread(s), reaped %ld",
            g_stats.threads_started.load(), g_stats.thread_deallocs.load());
     CHECKF(g_stats.workers_running.load() == 0, "%ld worker(s) still running", g_stats.workers_running.load());
 
+    if (g_failed_checks.load() != 0) {
+        fprintf(stderr, "  seed=%llu (override with KEXT_HARNESS_SEED)\n", static_cast<unsigned long long>(base_seed()));
+        if (!g_trace_dumped) dump_trace(stderr, 32);
+    }
     fflush(stdout);
     fflush(stderr);
     // exit() (not _exit) so sanitizer runtimes apply their failure exit codes.

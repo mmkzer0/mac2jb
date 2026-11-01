@@ -6,6 +6,7 @@
 #include <pthread.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -61,32 +62,51 @@ enum AllocKind {
 };
 
 struct Stats {
-    std::atomic<long> live_objects;     // OSObject instances alive (includes the two immortal OSBooleans)
-    std::atomic<long> live_locks;       // IOLock instances alive
-    std::atomic<long> threads_started;  // successful kernel_thread_start calls
-    std::atomic<long> thread_deallocs;  // first thread_deallocate per thread
-    std::atomic<long> workers_running;  // thread bodies currently executing
-    std::atomic<long> violations;       // shim-detected contract violations
-    std::atomic<long> alloc_seen;       // tracked allocations since arm/reset
+    std::atomic<long> live_objects;        // OSObject instances alive (includes the two immortal OSBooleans)
+    std::atomic<long> live_locks;          // IOLock instances alive
+    std::atomic<long> locks_held;          // locks currently held by some thread (sleep counts as released)
+    std::atomic<long> threads_started;     // successful kernel_thread_start calls
+    std::atomic<long> thread_deallocs;     // first thread_deallocate per thread
+    std::atomic<long> workers_running;     // thread bodies currently executing
+    std::atomic<long> violations;          // shim-detected contract violations
+    std::atomic<long> post_teardown_ops;   // worker-thread shim calls after mark_quiescent()
 };
 
 struct Faults {
-    std::atomic<unsigned long> alloc_fail_at;  // 1-based index among tracked allocs; 0 = disarmed
-    std::atomic<unsigned> alloc_mask;
-    std::atomic<bool> alloc_sticky;
-    std::atomic<bool> alloc_fired;
-    std::atomic<bool> thread_start;
+    std::atomic<unsigned> alloc_mask;  // AllocKind bits that count toward / can be failed by kOpAlloc
     std::atomic<bool> super_init;
     std::atomic<bool> super_start;
     std::atomic<bool> super_init_with_task;
+};
+
+// Shim-mediated operations that failure sweeps can target. Each has its own 1-based sequence.
+enum Op {
+    kOpAlloc = 0,         // every tracked allocation (OSDictionary/OSArray/OSString/OSSymbol/OSNumber/iterator/IOLock)
+    kOpLockAlloc,         // IOLockAlloc only (also counted under kOpAlloc)
+    kOpThreadStart,       // kernel_thread_start
+    kOpSetProperties,     // IOService::setProperties (the base implementation, i.e. calls into the provider)
+    kOpCount
 };
 
 extern Stats g_stats;
 extern Faults g_faults;
 extern std::atomic<unsigned> g_sleep_cap_ms;
 
-// Clears all fault state and per-run counters. live_objects is intentionally preserved.
+// Clears all fault state and per-run counters. live_objects and locks_held are intentionally preserved.
 void reset();
+
+// Generic failure injection: fail the nth `op` after this call (one-shot), or the nth and every later one (sticky).
+void arm_op_failure(Op op, unsigned long nth, bool sticky);
+void disarm_op_failures();
+bool op_failure_fired(Op op);
+unsigned long op_count(Op op);          // operations of this kind seen since arm/reset
+int op_failure_step(Op op);             // set_step() value when the injection first fired, -1 if not fired
+bool op_should_fail(Op op);             // counts one operation; true when it must fail
+const char *op_name(Op op);
+// Harness-provided phase marker, recorded when an injection fires.
+void set_step(int step);
+
+// Convenience wrappers over the generic API for kOpAlloc / kOpThreadStart.
 // Fails the nth tracked allocation of a kind in `kind_mask` after this call (one-shot unless sticky).
 void arm_alloc_failure(unsigned long nth, unsigned kind_mask = kAllocAllKinds, bool sticky = false);
 void disarm_alloc_failure();
@@ -96,6 +116,21 @@ void fail_next_thread_start();
 void fail_next_super_init();
 void fail_next_super_start();
 void fail_next_super_init_with_task();
+
+// Seeded scheduling/timing RNG: jitters IOSleepWithLeeway and inserts yields around lock operations.
+// Seed 0 (the initial state) disables jitter.
+void seed_rng(uint64_t seed);
+uint64_t next_random();
+
+// Fixed ring buffer of shim-mediated calls: {seq, op, result, thread}.
+void trace_event(const char *op, long result);
+void dump_trace(FILE *out, unsigned count);
+
+// After the object under test has been stopped/freed, no kext-created worker thread may call into the shim.
+// mark_quiescent() also verifies that no worker is still running.
+void mark_quiescent();
+void clear_quiescent();
+
 // Prints a shim violation to stderr and counts it.
 void violation(const char *fmt, ...);
 

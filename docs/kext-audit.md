@@ -58,14 +58,18 @@ IOKit boundary in user space and cannot replace the S3 hardware gate.
   imports (`IOLockSleep`, `IOLockWakeup`, `IORegistryEntry::setProperties`,
   `OSSymbol::metaClass`, `IOService::metaClass`) exist in the KDK 26.0 kernel
   symbol table.
-- Mock harness: `scripts/test-kext-harness.sh` builds and runs 12 tests under
-  ASan+UBSan and again under TSan; all pass (5.1 s). Coverage: shim lock
+- Mock harness: `scripts/test-kext-harness.sh` builds and runs 20 tests under
+  ASan+UBSan and again under TSan; all pass (5.7 s). Coverage: shim lock
   semantics; `setProperties` validation and an allocation-failure sweep; thread
   start failure; lifecycle permutations (start/stop/free, start/free, double
   stop, free without start/init, super failures); exactly-once teardown with
   100 stop/stopThread/poke races; user-client init/start/stop/clientClose/free
   orderings, poke-vs-close (200 iterations), not-ready dispatch; deadlock
-  scenario with the worker holding `m_pokeLock`.
+  scenario with the worker holding `m_pokeLock`; general one-shot and sticky
+  fault sweeps over every tracked allocation, `IOLockAlloc`,
+  `kernel_thread_start` and provider `setProperties` for both teardown
+  variants; a 256-entry operation trace dumped on failure; worker-after-
+  teardown, lock-balance and freed-lock checks; seeded sleep/lock jitter.
   Limits: the shim models IOKit; it cannot model the real
   `IOUSBDeviceController`, and the tests use `#define private public` to reach
   internals.
@@ -75,11 +79,12 @@ IOKit boundary in user space and cannot replace the S3 hardware gate.
 The SQLite testing review and the formal/semi-formal verification research are
 dispositioned in `docs/kext-verification-options.md`. Adopted in S1: the
 allocation-failure sweep shape, lifecycle permutations with a live-object
-baseline, and the watchdog. Adopted next: a general shim-operation failure
-sweep, an operation trace with “no call after stop/free”, a tagged live-object
-registry, and a TLA+ teardown model checked with TLC. Rejected: TCL/TH3/
-dbsqlfuzz artifacts, VFS shims, Frama-C/TrustInSoft/seL4, and KASAN for
-third-party kexts.
+baseline, the watchdog, the general shim-operation failure sweep, the operation
+trace with “no call after stop/free” and lock-balance checks, and seeded
+scheduling jitter. Adopted next: a tagged live-object registry, sweep sites for
+iterator creation and the second `getNextObject`, and a TLA+ teardown model
+checked with TLC. Rejected: TCL/TH3/dbsqlfuzz artifacts, VFS shims,
+Frama-C/TrustInSoft/seL4, and KASAN for third-party kexts.
 
 ## Residual risks
 
@@ -87,6 +92,14 @@ third-party kexts.
   (pre-existing). No reentrancy is known, but the harness cannot model the real
   `IOUSBDeviceController`. The S3 load/unload and transfer tests must watch for
   hangs.
+- `start()` called twice overwrites `m_provider` and `m_controller_provider`
+  after `retain()`, leaking one retain. The kernel start path calls it once;
+  this is outside the tested contract and has no start-twice test.
+- The sweeps' minimum-site thresholds (12 allocations, 2 lock allocations, 1
+  thread start, 1 provider call) and the 0-or-1 controller update assume the
+  current allocation pattern; source changes require retuning.
+- The seeded jitter reproduces the RNG stream, not the OS schedule; a failing
+  trial may not replay byte-for-byte.
 - No authorization check was added to the user client. The host runs
   unprivileged and the configuration path is gated by IOKit registry property
   policy; a non-root probe belongs to S3. Selector 0 is an idempotent re-apply.

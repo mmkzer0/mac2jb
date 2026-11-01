@@ -9,6 +9,7 @@ for path in \
     LICENSE \
     .gitignore \
     .github \
+    .githooks \
     Makefile \
     sender.c \
     commands.c \
@@ -49,6 +50,7 @@ for item in \
     LICENSE \
     .gitignore \
     .github \
+    .githooks \
     Makefile \
     sender.c \
     commands.c \

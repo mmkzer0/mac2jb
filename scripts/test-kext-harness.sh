@@ -1,6 +1,8 @@
 #!/bin/bash
 # Builds the real usbgadget kext translation units against the user-space IOKit shim in tests/kext/shim
 # and runs the lifecycle/fault-injection harness under ASan+UBSan, then under TSan.
+# Environment: KEXT_HARNESS_SEED=<n> replays the scheduling/timing RNG and failure sweeps of a reported failure;
+# KEXT_HARNESS_TEST_TIMEOUT_SECONDS=<n> overrides the 5 s per-test watchdog; KEXT_HARNESS_VERBOSE=1 enables IOLog.
 set -euo pipefail
 PATH=/usr/bin:/bin:/usr/sbin:/sbin
 export PATH
