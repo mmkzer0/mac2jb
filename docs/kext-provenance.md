@@ -1,13 +1,14 @@
-# Kext build provenance (S0)
+# Kext build provenance (S0, S1)
 
-Status: S0 evidence record.
+Status: build and hardening evidence.
 Capture: 2026-11-01, branch `harden/kext-build`, host macOS 27.0 (26A428),
 Xcode 27.2 (27B52), SDK `MacOSX27.2.sdk`.
 
-This record compares the S0 Release build of `usbgadget.kext` against the
-shipped `drivers/usbgadget.kext`. Byte-identical reproduction is **not**
-claimed; the goal is to explain every observed difference and to fix the
-source-to-artifact chain for the hardening work.
+The shipped `drivers/usbgadget.kext` was built by the upstream maintainer with
+Xcode 2660 / SDK 26.5 in a Debug configuration (evidence below). Our artifacts
+are Release builds from the vendored source with the current toolchain.
+Byte-identical reproduction is **not** claimed; every observed difference is
+explained or bounded.
 
 ## Reproduce
 
@@ -23,7 +24,7 @@ python3 scripts/kext-provenance.py report \
   --source vendor/macos_usb_gadget_poc/usbgadget
 ```
 
-The Debug reference used in the analysis below:
+Debug reference (used to explain the shipped binary's code size):
 
 ```sh
 D="$(mktemp -d)"
@@ -34,15 +35,15 @@ xcodebuild -project usbgadget.xcodeproj -configuration Debug -sdk macosx \
   SYMROOT="$D/sym" OBJROOT="$D/obj" build
 ```
 
-## Report
+## S1 hardened build
 
 ```text
 ## Artifacts
 
 - Built: `build/kext/usbgadget.kext`
-  - Total size: 115808 bytes
-  - Executable: `Contents/MacOS/usbgadget` (113552 bytes)
-    - SHA256: `ef1dcf6edd9a2af5be43686b865e93b6e57447d5185ff31df275d1af624f0a7f`
+  - Total size: 116656 bytes
+  - Executable: `Contents/MacOS/usbgadget` (114400 bytes)
+    - SHA256: `41f650949afcecf9bd730212d55a2ee3254c7c748962d5ebb2d81e86ed8546cf`
   - Info.plist: `Contents/Info.plist` (2256 bytes)
     - SHA256: `a4ca368ce107273aaf008a8dd68d1de898eb9889c5efc6e56ea76601912ce0bd`
 - Shipped: `drivers/usbgadget.kext`
@@ -64,11 +65,17 @@ xcodebuild -project usbgadget.xcodeproj -configuration Debug -sdk macosx \
 
 ## Undefined symbols
 
-- Counts: built has 351 undefined symbols, shipped has 351 undefined symbols.
-- Added in built (0):
-  - none
-- Removed in built (0):
-  - none
+- Counts: built has 353 undefined symbols, shipped has 351 undefined symbols.
+- Added in built (5):
+  - `_IOLockSleep`
+  - `_IOLockWakeup`
+  - `__ZN15IORegistryEntry13setPropertiesEP8OSObject`
+  - `__ZN8OSSymbol9metaClassE`
+  - `__ZN9IOService9metaClassE`
+- Removed in built (3):
+  - `__ZN12IOUserClient11clientCloseEv`
+  - `__ZN12IOUserClient4freeEv`
+  - `__ZN31gay_bowser_usbgadget_userclient13setPropertiesEP8OSObject`
 
 ## Sections
 
@@ -77,64 +84,83 @@ xcodebuild -project usbgadget.xcodeproj -configuration Debug -sdk macosx \
   - none
 - Removed sections (0):
   - none
-- Changed sections (2):
+- Changed sections (6):
   - `__DATA,__data`: built 200 bytes, shipped 196 bytes (+4 bytes)
-  - `__TEXT_EXEC,__text`: built 5220 bytes, shipped 6764 bytes (-1544 bytes)
+  - `__DATA_CONST,__auth_got`: built 216 bytes, shipped 200 bytes (+16 bytes)
+  - `__DATA_CONST,__got`: built 72 bytes, shipped 56 bytes (+16 bytes)
+  - `__TEXT,__cstring`: built 977 bytes, shipped 835 bytes (+142 bytes)
+  - `__TEXT_EXEC,__auth_stubs`: built 432 bytes, shipped 400 bytes (+32 bytes)
+  - `__TEXT_EXEC,__text`: built 6452 bytes, shipped 6764 bytes (-312 bytes)
 
 ## Defined symbols
 
-- Counts: built has 76 defined symbols, shipped has 74 defined symbols.
-- Added in built (4):
+- Counts: built has 81 defined symbols, shipped has 74 defined symbols.
+- Added in built (10):
   - `_OSKextGetCurrentIdentifier`
   - `_OSKextGetCurrentLoadTag`
   - `_OSKextGetCurrentVersionString`
+  - `__Z16thread_bootstrapPvi`
+  - `__ZN20gay_bowser_usbgadget10stopThreadEv`
+  - `__ZN31gay_bowser_usbgadget_userclient11clientCloseEv`
+  - `__ZN31gay_bowser_usbgadget_userclient12copyProviderEv`
+  - `__ZN31gay_bowser_usbgadget_userclient15releaseProviderEv`
+  - `__ZN31gay_bowser_usbgadget_userclient4freeEv`
   - `__kext_apple_cc`
-- Removed in built (2):
+- Removed in built (3):
+  - `__Z16thread_bootstrapPv`
   - `__ZN11OSMetaClassdlEPvm`
   - `___cxx_global_var_init`
 
 ## Strings (-n 8)
 
-- Unique strings (-a -n 8, minimum length 8): built has 18, shipped has 18.
-- Added in built (0):
-  - none
+- Unique strings (-a -n 8, minimum length 8): built has 20, shipped has 18.
+- Added in built (2):
+  - `usbgadget: Executing 'gay_bowser_usbgadget_userclient::clientClose()'.`
+  - `usbgadget: Failed to allocate lock in 'gay_bowser_usbgadget:init()'.`
 - Removed in built (0):
   - none
 
 These artifacts were built with different Xcode/SDK versions; byte-identical reproduction is not claimed.
 ```
 
-## Analysis
+### S1 analysis
 
-The shipped binary and the S0 Release build agree on everything that identifies
-the source-level contract:
+- The five new imports are all kernel exports: `_IOLockSleep`, `_IOLockWakeup`,
+  `IORegistryEntry::setProperties`, `OSSymbol::metaClass` and
+  `IOService::metaClass` are present in the KDK 26.0 kernel symbol table. The
+  three removed imports were the dead user-client `setProperties` symbol and the
+  base `IOUserClient::clientClose`/`free` stubs; the hardened code implements
+  both explicitly.
+- `__TEXT_EXEC,__text` is 6452 bytes against the shipped 6764 (-312) and the S0
+  Release build's 5220. The hardening adds roughly 1.2 KiB; the shipped binary
+  remains a Debug build (see below), which is why it is still slightly larger.
+- Defined symbols add the new `stopThread`, `copyProvider`, `releaseProvider`,
+  `clientClose`, `free` and the two-argument `thread_bootstrap`; the removed
+  `OSMetaClass::operator delete` and `___cxx_global_var_init` are Debug-codegen
+  artifacts present in the shipped binary.
+- Strings gain exactly two new log lines (`clientClose`, lock-allocation
+  failure); no protocol string changed.
+- `Info.plist` is unchanged from S0: toolchain fields plus
+  `LSMinimumSystemVersion` 12.0 (the original 10.11 target is rejected by
+  Xcode 27).
 
-- 351/351 undefined imports, identical sets.
-- 18/18 strings of at least 8 bytes, identical sets.
-- 10/10 Mach-O sections; the section set is identical.
-- arm64e Mach-O kext bundle; both unsigned.
+## S0 baseline (history)
 
-The remaining differences are configuration and toolchain, not source:
+The pre-hardening Release build (`ef1dcf6e…`, executable 113552 bytes,
+`__TEXT_EXEC,__text` 5220 bytes) had 351/351 identical undefined symbols and
+18/18 identical strings of at least 8 bytes against the shipped binary.
 
-- `__TEXT_EXEC,__text` is 5220 bytes in the Release build and 6764 bytes in the
-  shipped binary. A **Debug** (`-O0`) build of the same vendored project with
-  Xcode 27.2 yields 6824 bytes (0.9 percent above the shipped size) and 428
-  disassembly lines versus 424 for the shipped binary. Its defined-symbol
-  surface matches the shipped binary except four symbols emitted by the newer
-  headers (`__kext_apple_cc`, `_OSKextGetCurrent*`). The shipped binary is
-  therefore consistent with a Debug build produced by Xcode 2660 / SDK 26.5, as
-  recorded in its `Info.plist`.
-- The Release build additionally drops `___cxx_global_var_init` and
-  `OSMetaClass::operator delete`, which the Debug build retains; the four
-  `_OSKextGetCurrent*` / `__kext_apple_cc` symbols are SDK-emitted and appear in
-  both of our builds.
-- `__DATA,__data` differs by four bytes (200 versus 196).
-- `Info.plist` differs only in toolchain fields (`BuildMachineOSBuild`,
-  `DTPlatform*`, `DTSDK*`, `DTXcode*`) and `LSMinimumSystemVersion`
-  (`11` -> `12.0`, required because Xcode 27 rejects the original 10.11 target
-  and 12.0 is the supported floor).
+The shipped binary matches a **Debug** (`-O0`) build of the same source under
+the current toolchain: `__TEXT_EXEC,__text` 6824 bytes (0.9 percent above the
+shipped 6764), identical undefined symbols, identical meaningful strings, and
+only four header-emitted defined symbols of difference. Its `Info.plist`
+records Xcode 2660 / SDK 26.5. The shipped artifact's exact build configuration
+was never recorded by the upstream project; the Debug inference is the
+best-supported explanation for the code-size delta.
 
-Consequence: the shipped binary cannot be reproduced byte-for-byte from this
-tree with the current toolchain, and its exact build configuration was never
-recorded. The S0 artifact is a Release build; behavioral equivalence must be
-shown by the S1 harness and the S3 hardware test, not by this comparison.
+## Consequence
+
+The source-to-artifact chain is reproducible on this host, and every
+difference to the shipped binary is either a deliberate hardening change or a
+toolchain/configuration artifact. Behavioral equivalence still rests on the S1
+mock-IOKit harness and the S3 hardware test, not on this comparison.

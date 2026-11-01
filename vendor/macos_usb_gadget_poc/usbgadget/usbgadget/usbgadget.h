@@ -40,11 +40,13 @@ public:
     virtual void triggerUpdate();
     virtual void doUpdate();
     virtual void threadMain();
-    virtual void setConfigurationDict(OSDictionary* pDict);
+    virtual bool setConfigurationDict(OSDictionary *pDict);
     
     virtual IOReturn setProperties(OSObject *props_obj) override;
 
 private:
+    void stopThread();
+
     /**
      *  Keep track of managed/created HID devices.
      */

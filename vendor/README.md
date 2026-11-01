@@ -18,7 +18,9 @@ source files. Root `LICENSE` does not override third-party terms.
   2026-11-01 downstream change: MACOSX_DEPLOYMENT_TARGET was raised from 10.11
   to 12.0 (Xcode 27 rejects older targets) and the Info.plist Copy Bundle
   Resources entry was removed so the bundle keeps exactly Contents/Info.plist;
-  upstream.lock still records the upstream origin revision.
+  upstream.lock still records the upstream origin revision. 2026-11-01
+  downstream hardening: usbgadget.kext lifetime/ownership/thread teardown paths
+  (provider retain, worker join, user-client provider release) were fixed.
 - ns2jb: the `BermTheSequel/ns2jb2` fork, based on pepsipu's
   original project, replaces the previous runtime. Its complete snapshot and
   tests are pinned in `upstream.lock`. All runtime, exploit, and test files are

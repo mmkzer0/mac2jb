@@ -13,11 +13,14 @@ gay_bowser_usbgadget::setDictionaryNumber(const char * symbol,
 								 UInt32 value,
 								 OSDictionary * dictionary)
 {
+	if (!dictionary)
+		return false;
 	OSNumber * number = OSNumber::withNumber(value, 32);
 	if (number)
 	{
-		dictionary->setObject(symbol, number);
-		return true;
+		bool ok = dictionary->setObject(symbol, number);
+		number->release();
+		return ok;
 	}
 	return false;
 }
@@ -27,11 +30,14 @@ gay_bowser_usbgadget::setDictionaryString(const char * symbol,
 								 char * value,
 								 OSDictionary * dictionary)
 {
+	if (!value || !dictionary)
+		return false;
 	OSString * string = OSString::withCString(value);
 	if (string)
 	{
-		dictionary->setObject(symbol, string);
-		return true;
+		bool ok = dictionary->setObject(symbol, string);
+		string->release();
+		return ok;
 	}
 	return false;
 }
@@ -41,11 +47,14 @@ gay_bowser_usbgadget::setDictionaryString(const char * symbol,
 								 const char * value,
 								 OSDictionary * dictionary)
 {
+	if (!value || !dictionary)
+		return false;
 	OSString * string = OSString::withCString(value);
 	if (string)
 	{
-		dictionary->setObject(symbol, string);
-		return true;
+		bool ok = dictionary->setObject(symbol, string);
+		string->release();
+		return ok;
 	}
 	return false;
 }
@@ -55,8 +64,9 @@ gay_bowser_usbgadget::setDictionaryString(const char * symbol,
 								 const OSSymbol * value,
 								 OSDictionary * dictionary)
 {
-	dictionary->setObject(symbol, value);
-	return true;
+	if (!value || !dictionary)
+		return false;
+	return dictionary->setObject(symbol, value);
 }
 
 bool
@@ -64,11 +74,12 @@ gay_bowser_usbgadget::setDictionaryBoolean(const char * symbol,
 								  bool value,
 								  OSDictionary * dictionary)
 {
+	if (!dictionary)
+		return false;
 	OSBoolean * boolean = value ? kOSBooleanTrue : kOSBooleanFalse;
 	if (boolean)
 	{
-		dictionary->setObject(symbol, boolean);
-		return true;
+		return dictionary->setObject(symbol, boolean);
 	}
 	return false;
 }
@@ -78,8 +89,9 @@ gay_bowser_usbgadget::setDictionaryArray(const char * symbol,
 								OSArray * value,
 								OSDictionary * dictionary)
 {
-	dictionary->setObject(symbol, value);
-	return true;
+	if (!value || !dictionary)
+		return false;
+	return dictionary->setObject(symbol, value);
 }
 
 bool
@@ -87,19 +99,26 @@ gay_bowser_usbgadget::setDictionaryDictionary(const char * symbol,
 									 OSDictionary * value,
 									 OSDictionary * dictionary)
 {
-	dictionary->setObject(symbol, value);
-	return true;
+	if (!value || !dictionary)
+		return false;
+	return dictionary->setObject(symbol, value);
 }
 
-void gay_bowser_usbgadget::setConfigurationDict(OSDictionary* pDict)
+bool gay_bowser_usbgadget::setConfigurationDict(OSDictionary* pDict)
 {
-    if (!pDict) return;
+    if (!pDict) return false;
+    
+    OSDictionary *copy = OSDictionary::withDictionary(pDict);
+    if (!copy) return false;
     
     IOLockLock(m_pokeLock);
-    if (m_configuration)
-        m_configuration->release();
-    m_configuration = OSDictionary::withDictionary(pDict);
+    OSDictionary *old = m_configuration;
+    m_configuration = copy;
     IOLockUnlock(m_pokeLock);
+    
+    if (old)
+        old->release();
+    return true;
 }
 
 void gay_bowser_usbgadget::triggerUpdate()
@@ -110,6 +129,7 @@ void gay_bowser_usbgadget::triggerUpdate()
     IOLockUnlock(m_pokeLock);
 }
 
+// Called with m_pokeLock held (from threadMain).
 void gay_bowser_usbgadget::doUpdate()
 {
     //setProperty("test", OSString::withCString("updated"));
@@ -117,14 +137,16 @@ void gay_bowser_usbgadget::doUpdate()
     if (!m_configuration) return;
     
     OSDictionary* pCommandDict = OSDictionary::withCapacity(1);
-    setDictionaryString("USBDeviceCommand", "SetDeviceConfiguration", pCommandDict);
-    setDictionaryDictionary("USBDeviceCommandParameter", m_configuration, pCommandDict);
+    if (!pCommandDict) return;
+    
+    bool built = setDictionaryString("USBDeviceCommand", "SetDeviceConfiguration", pCommandDict) &&
+        setDictionaryDictionary("USBDeviceCommandParameter", m_configuration, pCommandDict);
     
     // debug
     //setProperty("DeviceDescription", pCommandDict);
     
     // Send it off to IOUSBDeviceInterface
-    if (m_controller_provider)
+    if (built && m_controller_provider)
         m_controller_provider->setProperties(pCommandDict);
     
     pCommandDict->release();
@@ -132,9 +154,9 @@ void gay_bowser_usbgadget::doUpdate()
 
 void gay_bowser_usbgadget::threadMain()
 {
+    IOLockLock(m_pokeLock);
     while (!m_exitThreads)
     {
-        IOLockLock(m_pokeLock);
         if (m_needsUpdate)
         {
             doUpdate();
@@ -143,13 +165,18 @@ void gay_bowser_usbgadget::threadMain()
         IOLockUnlock(m_pokeLock);
 
         IOSleepWithLeeway(100, 1000);
+
+        IOLockLock(m_pokeLock);
     }
     
     m_threadDone = true;
+    IOLockWakeup(m_pokeLock, &m_threadDone, false);
+    IOLockUnlock(m_pokeLock);
 }
 
-void thread_bootstrap(void* threadArgument )
+void thread_bootstrap(void* threadArgument, wait_result_t result)
 {
+    (void)result;
     gay_bowser_usbgadget* driver = (gay_bowser_usbgadget*) threadArgument;
     driver->threadMain();
 }
@@ -157,32 +184,39 @@ void thread_bootstrap(void* threadArgument )
 bool gay_bowser_usbgadget::start(IOService *provider) {
     LogD("Executing 'gay_bowser_usbgadget::start()'.");
     
-    bool ret = super::start(provider);
-    if (ret) {
-        LogD("Calling 'gay_bowser_usbgadget:registerService()'.");
-        registerService();
-    }
-    
-    m_controller_provider = provider;
-    if (!m_controller_provider) {
+    IOService *controller = OSDynamicCast(IOService, provider);
+    if (!controller) {
         return false;
     }
+    
+    controller->retain();
+    IOLockLock(m_pokeLock);
+    m_controller_provider = controller;
+    IOLockUnlock(m_pokeLock);
+    
+    if (!super::start(provider)) {
+        IOLockLock(m_pokeLock);
+        m_controller_provider = NULL;
+        IOLockUnlock(m_pokeLock);
+        controller->release();
+        return false;
+    }
+    
+    LogD("Calling 'gay_bowser_usbgadget:registerService()'.");
+    registerService();
 
-    return ret;
+    return true;
 }
 
 void gay_bowser_usbgadget::stop(IOService *provider) {
-    m_needsUpdate = false;
-    m_exitThreads = true;
-    
-    IOLockLock(m_pokeLock);
-    IOLockUnlock(m_pokeLock);
-    
-    while (!m_threadDone) {
-        IOSleepWithLeeway(100, 1000);
-    }
-    
     LogD("Executing 'gay_bowser_usbgadget:stop()'.");
+    
+    stopThread();
+    
+    if (m_controller_provider) {
+        m_controller_provider->release();
+        m_controller_provider = NULL;
+    }
     
     super::stop(provider);
 }
@@ -190,12 +224,17 @@ void gay_bowser_usbgadget::stop(IOService *provider) {
 bool gay_bowser_usbgadget::init(OSDictionary *dictionary) {
     LogD("Executing 'gay_bowser_usbgadget:init()'.");
     
-    bool ret = super::init(dictionary);
-    
     m_controller_provider = NULL;
     m_configuration = NULL;
-    
+    m_pokeLock = NULL;
+    m_thread = THREAD_NULL;
     m_threadDone = false;
+    m_needsUpdate = false;
+    m_exitThreads = false;
+    
+    if (!super::init(dictionary)) {
+        return false;
+    }
 
 #if 0
     // root.ConfigurationDescriptors[0].Interfaces[0]
@@ -231,47 +270,79 @@ bool gay_bowser_usbgadget::init(OSDictionary *dictionary) {
     //pConfigWrapDict->release();
 #endif
 
-    m_needsUpdate = false;
-    m_exitThreads = false;
     m_pokeLock = IOLockAlloc();
-    //StartThreadWithArgument(this);
+    if (!m_pokeLock) {
+        LogD("Failed to allocate lock in 'gay_bowser_usbgadget:init()'.");
+        return false;
+    }
     
-    kern_return_t kr = kernel_thread_start( (thread_continue_t)thread_bootstrap, this, &m_thread );
+    thread_t thread = THREAD_NULL;
+    kern_return_t kr = kernel_thread_start(thread_bootstrap, this, &thread);
     if( kr != KERN_SUCCESS )
     {
         LogD("Failed to start thread in 'gay_bowser_usbgadget:init()' (%x).", kr);
     }
+    else
+    {
+        m_thread = thread;
+    }
     
-    return ret;
+    return true;
 }
 
 void gay_bowser_usbgadget::free() {
     LogD("Executing 'gay_bowser_usbgadget:free()'.");
     
-    m_needsUpdate = false;
-    m_exitThreads = true;
+    stopThread();
     
-    //if (m_configuration)
-    //    m_configuration->release();
+    if (m_controller_provider) {
+        m_controller_provider->release();
+        m_controller_provider = NULL;
+    }
     
-    thread_deallocate( m_thread );
+    if (m_configuration) {
+        m_configuration->release();
+        m_configuration = NULL;
+    }
     
-    IOLockLock(m_pokeLock);
-    IOLockUnlock(m_pokeLock);
-    
-    IOLockFree(m_pokeLock);
-    m_pokeLock = NULL;
+    if (m_pokeLock) {
+        IOLockFree(m_pokeLock);
+        m_pokeLock = NULL;
+    }
     
     super::free();
+}
+
+// Stops and reaps the worker exactly once; later or concurrent callers that find
+// no thread return without deallocating. Safe when no thread was ever started.
+void gay_bowser_usbgadget::stopThread() {
+    thread_t thread = THREAD_NULL;
+    
+    if (m_pokeLock) {
+        IOLockLock(m_pokeLock);
+        m_needsUpdate = false;
+        m_exitThreads = true;
+        if (m_thread != THREAD_NULL) {
+            // IOLockSleep drops m_pokeLock while asleep and retakes it on wakeup.
+            while (!m_threadDone) {
+                IOLockSleep(m_pokeLock, &m_threadDone, THREAD_UNINT);
+            }
+            thread = m_thread;
+            m_thread = THREAD_NULL;
+        }
+        IOLockUnlock(m_pokeLock);
+    }
+    
+    if (thread != THREAD_NULL) {
+        thread_deallocate(thread);
+    }
 }
 
 IOReturn gay_bowser_usbgadget::setProperties(OSObject *props_obj)
 {
     IOReturn        return_value = kIOReturnSuccess;
 	OSDictionary    *dict = OSDynamicCast(OSDictionary, props_obj);
-	const OSSymbol  *key = NULL;
-	OSObject        *obj = NULL;
-	OSCollectionIterator* iter;
+	OSCollectionIterator* iter = NULL;
 
 	if (!dict) {
 		return kIOReturnBadArgument;
@@ -280,21 +351,40 @@ IOReturn gay_bowser_usbgadget::setProperties(OSObject *props_obj)
 	const OSSymbol* publish_configuration_string        = OSSymbol::withCString("PublishConfiguration");
     const OSSymbol* poke_string        = OSSymbol::withCString("Poke");
 
-	iter = OSCollectionIterator::withCollection(dict);
+	if (publish_configuration_string && poke_string) {
+		iter = OSCollectionIterator::withCollection(dict);
+	}
 	if (!iter) {
-		return_value = kIOReturnNoMemory;
-		goto exit;
+		if (publish_configuration_string)
+			publish_configuration_string->release();
+		if (poke_string)
+			poke_string->release();
+		return kIOReturnNoMemory;
 	}
 
-	while ((key = (const OSSymbol *) iter->getNextObject()) &&
-	    (obj = dict->getObject(key))) {
+	OSObject *raw;
+	while ((raw = iter->getNextObject())) {
+		const OSSymbol *key = OSDynamicCast(OSSymbol, raw);
+		if (!key) {
+			continue;
+		}
+		OSObject *obj = dict->getObject(key);
+		if (!obj) {
+			continue;
+		}
+
 		if (key->isEqualTo(publish_configuration_string)) {
-        
             OSDictionary* value = OSDynamicCast(OSDictionary, obj);
 			if (value) {
-                setConfigurationDict(value);
+                if (!setConfigurationDict(value)) {
+                    return_value = kIOReturnNoMemory;
+                    break;
+                }
                 
 				setProperty(key, obj);
+			}
+			else {
+				return_value = kIOReturnBadArgument;
 			}
 		}
         else if (key->isEqualTo(poke_string)) {
@@ -304,11 +394,9 @@ IOReturn gay_bowser_usbgadget::setProperties(OSObject *props_obj)
 			LogD("setProperties(%s) not handled\n", key->getCStringNoCopy());
 		}
 	}
- 
-    
 
-exit:
-    iter->release();
-    publish_configuration_string->release();
+	iter->release();
+	publish_configuration_string->release();
+	poke_string->release();
 	return return_value;
 }

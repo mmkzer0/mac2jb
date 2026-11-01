@@ -67,6 +67,8 @@ for item in \
     packaging \
     drivers \
     assets \
+    tests \
+    docs \
     vendor
 do
     if [[ -e "$item" ]]; then

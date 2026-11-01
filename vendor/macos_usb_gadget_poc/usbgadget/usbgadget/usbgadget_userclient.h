@@ -24,13 +24,13 @@ public:
     
     virtual bool start(IOService *provider) override;
     virtual void stop(IOService *provider) override;
+    virtual IOReturn clientClose(void) override;
+    virtual void free(void) override;
     
     virtual IOReturn externalMethod(uint32_t selector,
                                     IOExternalMethodArguments *arguments,
                                     IOExternalMethodDispatch *dispatch,
                                     OSObject *target, void *reference) override;
-    
-    virtual IOReturn setProperties(OSObject *props_obj) override;
 
 protected:
     /**
@@ -56,6 +56,21 @@ private:
      *  Driver provider.
      */
     gay_bowser_usbgadget *m_provider;
+    
+    /**
+     *  Guards m_provider so clientClose()/stop() cannot release it under an in-flight method.
+     */
+    IOLock *m_providerLock;
+    
+    /**
+     *  Idempotent: releases and nulls m_provider.
+     */
+    void releaseProvider();
+    
+    /**
+     *  Returns a retained provider, or nullptr when closed.
+     */
+    gay_bowser_usbgadget *copyProvider();
 };
 
 #endif // _USBGADGET_USERCLIENT_H
