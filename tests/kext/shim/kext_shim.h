@@ -77,6 +77,7 @@ struct Faults {
     std::atomic<bool> super_init;
     std::atomic<bool> super_start;
     std::atomic<bool> super_init_with_task;
+    std::atomic<bool> super_set_property;
 };
 
 // Shim-mediated operations that failure sweeps can target. Each has its own 1-based sequence.
@@ -116,6 +117,7 @@ void fail_next_thread_start();
 void fail_next_super_init();
 void fail_next_super_start();
 void fail_next_super_init_with_task();
+void fail_next_set_property();
 
 // Seeded scheduling/timing RNG: jitters IOSleepWithLeeway and inserts yields around lock operations.
 // Seed 0 (the initial state) disables jitter.

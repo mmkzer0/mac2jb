@@ -74,6 +74,7 @@ void reset() {
     g_faults.super_init = false;
     g_faults.super_start = false;
     g_faults.super_init_with_task = false;
+    g_faults.super_set_property = false;
     g_sleep_cap_ms = 2;
     g_step = 0;
     g_quiescent = false;
@@ -150,6 +151,7 @@ void fail_next_thread_start() { arm_op_failure(kOpThreadStart, 1, false); }
 void fail_next_super_init() { g_faults.super_init = true; }
 void fail_next_super_start() { g_faults.super_start = true; }
 void fail_next_super_init_with_task() { g_faults.super_init_with_task = true; }
+void fail_next_set_property() { g_faults.super_set_property = true; }
 
 void seed_rng(uint64_t seed) { g_rng = seed; }
 
@@ -744,11 +746,23 @@ void IOService::registerService(IOOptionBits options) {
 }
 
 bool IOService::setProperty(const OSSymbol *key, OSObject *value) {
-    return properties_ && properties_->setObject(key, value);
+    if (consume(g_faults.super_set_property)) {
+        trace_event("IOService::setProperty", 0);
+        return false;
+    }
+    bool ok = properties_ && properties_->setObject(key, value);
+    trace_event("IOService::setProperty", ok);
+    return ok;
 }
 
 bool IOService::setProperty(const char *key, OSObject *value) {
-    return properties_ && properties_->setObject(key, value);
+    if (consume(g_faults.super_set_property)) {
+        trace_event("IOService::setProperty", 0);
+        return false;
+    }
+    bool ok = properties_ && properties_->setObject(key, value);
+    trace_event("IOService::setProperty", ok);
+    return ok;
 }
 
 OSObject *IOService::getProperty(const OSSymbol *key) const {

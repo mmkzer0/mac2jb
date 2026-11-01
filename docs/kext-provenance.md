@@ -1,7 +1,7 @@
-# Kext build provenance (S0, S1)
+# Kext build provenance (S0, S1, S1.1)
 
 Status: build and hardening evidence.
-Capture: 2026-11-01, branch `harden/kext-build`, host macOS 27.0 (26A428),
+Capture: 2026-11-01, branch `dev`, host macOS 27.0 (26A428),
 Xcode 27.2 (27B52), SDK `MacOSX27.2.sdk`.
 
 The shipped `drivers/usbgadget.kext` was built by the upstream maintainer with
@@ -35,15 +35,15 @@ xcodebuild -project usbgadget.xcodeproj -configuration Debug -sdk macosx \
   SYMROOT="$D/sym" OBJROOT="$D/obj" build
 ```
 
-## S1 hardened build
+## S1.1 hardened build
 
 ```text
 ## Artifacts
 
 - Built: `build/kext/usbgadget.kext`
-  - Total size: 116656 bytes
-  - Executable: `Contents/MacOS/usbgadget` (114400 bytes)
-    - SHA256: `41f650949afcecf9bd730212d55a2ee3254c7c748962d5ebb2d81e86ed8546cf`
+  - Total size: 116592 bytes
+  - Executable: `Contents/MacOS/usbgadget` (114336 bytes)
+    - SHA256: `e8e82a5794b50a9ab4ec8bfd2944848189e4c93ba2a8e53c946ccff7e8a11d8e`
   - Info.plist: `Contents/Info.plist` (2256 bytes)
     - SHA256: `a4ca368ce107273aaf008a8dd68d1de898eb9889c5efc6e56ea76601912ce0bd`
 - Shipped: `drivers/usbgadget.kext`
@@ -65,11 +65,12 @@ xcodebuild -project usbgadget.xcodeproj -configuration Debug -sdk macosx \
 
 ## Undefined symbols
 
-- Counts: built has 353 undefined symbols, shipped has 351 undefined symbols.
-- Added in built (5):
+- Counts: built has 354 undefined symbols, shipped has 351 undefined symbols.
+- Added in built (6):
   - `_IOLockSleep`
   - `_IOLockWakeup`
   - `__ZN15IORegistryEntry13setPropertiesEP8OSObject`
+  - `__ZN8OSString9metaClassE`
   - `__ZN8OSSymbol9metaClassE`
   - `__ZN9IOService9metaClassE`
 - Removed in built (3):
@@ -84,17 +85,18 @@ xcodebuild -project usbgadget.xcodeproj -configuration Debug -sdk macosx \
   - none
 - Removed sections (0):
   - none
-- Changed sections (6):
+- Changed sections (7):
   - `__DATA,__data`: built 200 bytes, shipped 196 bytes (+4 bytes)
   - `__DATA_CONST,__auth_got`: built 216 bytes, shipped 200 bytes (+16 bytes)
-  - `__DATA_CONST,__got`: built 72 bytes, shipped 56 bytes (+16 bytes)
-  - `__TEXT,__cstring`: built 977 bytes, shipped 835 bytes (+142 bytes)
+  - `__DATA_CONST,__const`: built 5288 bytes, shipped 5296 bytes (-8 bytes)
+  - `__DATA_CONST,__got`: built 80 bytes, shipped 56 bytes (+24 bytes)
+  - `__TEXT,__cstring`: built 1023 bytes, shipped 835 bytes (+188 bytes)
   - `__TEXT_EXEC,__auth_stubs`: built 432 bytes, shipped 400 bytes (+32 bytes)
-  - `__TEXT_EXEC,__text`: built 6452 bytes, shipped 6764 bytes (-312 bytes)
+  - `__TEXT_EXEC,__text`: built 6744 bytes, shipped 6764 bytes (-20 bytes)
 
 ## Defined symbols
 
-- Counts: built has 81 defined symbols, shipped has 74 defined symbols.
+- Counts: built has 80 defined symbols, shipped has 74 defined symbols.
 - Added in built (10):
   - `_OSKextGetCurrentIdentifier`
   - `_OSKextGetCurrentLoadTag`
@@ -106,40 +108,45 @@ xcodebuild -project usbgadget.xcodeproj -configuration Debug -sdk macosx \
   - `__ZN31gay_bowser_usbgadget_userclient15releaseProviderEv`
   - `__ZN31gay_bowser_usbgadget_userclient4freeEv`
   - `__kext_apple_cc`
-- Removed in built (3):
+- Removed in built (4):
   - `__Z16thread_bootstrapPv`
   - `__ZN11OSMetaClassdlEPvm`
+  - `__ZN20gay_bowser_usbgadget20setConfigurationDictEP12OSDictionary`
   - `___cxx_global_var_init`
 
 ## Strings (-n 8)
 
 - Unique strings (-a -n 8, minimum length 8): built has 20, shipped has 18.
-- Added in built (2):
+- Added in built (3):
+  - `usbgadget: Controller setProperties failed in 'gay_bowser_usbgadget:doUpdate()' (0x%x).`
   - `usbgadget: Executing 'gay_bowser_usbgadget_userclient::clientClose()'.`
   - `usbgadget: Failed to allocate lock in 'gay_bowser_usbgadget:init()'.`
-- Removed in built (0):
-  - none
+- Removed in built (1):
+  - `usbgadget: setProperties(%s) not handled`
 
 These artifacts were built with different Xcode/SDK versions; byte-identical reproduction is not claimed.
 ```
 
-### S1 analysis
+### S1.1 analysis
 
-- The five new imports are all kernel exports: `_IOLockSleep`, `_IOLockWakeup`,
-  `IORegistryEntry::setProperties`, `OSSymbol::metaClass` and
-  `IOService::metaClass` are present in the KDK 26.0 kernel symbol table. The
-  three removed imports were the dead user-client `setProperties` symbol and the
-  base `IOUserClient::clientClose`/`free` stubs; the hardened code implements
-  both explicitly.
-- `__TEXT_EXEC,__text` is 6452 bytes against the shipped 6764 (-312) and the S0
-  Release build's 5220. The hardening adds roughly 1.2 KiB; the shipped binary
+- The six new imports are all kernel exports: `_IOLockSleep`, `_IOLockWakeup`,
+  `IORegistryEntry::setProperties`, `OSString::metaClass`,
+  `OSSymbol::metaClass` and `IOService::metaClass` are present in the KDK 26.0
+  kernel symbol table. The three removed imports were the dead user-client
+  `setProperties` symbol and the base `IOUserClient::clientClose`/`free` stubs;
+  the hardened code implements both explicitly.
+- `__TEXT_EXEC,__text` is 6744 bytes against the shipped 6764 (-20) and the S0
+  Release build's 5220. The hardening adds roughly 1.5 KiB; the shipped binary
   remains a Debug build (see below), which is why it is still slightly larger.
 - Defined symbols add the new `stopThread`, `copyProvider`, `releaseProvider`,
   `clientClose`, `free` and the two-argument `thread_bootstrap`; the removed
-  `OSMetaClass::operator delete` and `___cxx_global_var_init` are Debug-codegen
-  artifacts present in the shipped binary.
-- Strings gain exactly two new log lines (`clientClose`, lock-allocation
-  failure); no protocol string changed.
+  `gay_bowser_usbgadget::setConfigurationDict` is the helper replaced by the
+  validate/copy/publish sequence. The removed `OSMetaClass::operator delete` and
+  `___cxx_global_var_init` are Debug-codegen artifacts present in the shipped
+  binary.
+- Strings gain three new log lines (controller `setProperties` failure,
+  `clientClose`, lock-allocation failure) and lose the old unknown-key log; no
+  protocol string changed.
 - `Info.plist` is unchanged from S0: toolchain fields plus
   `LSMinimumSystemVersion` 12.0 (the original 10.11 target is rejected by
   Xcode 27).

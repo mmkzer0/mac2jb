@@ -14,6 +14,10 @@ bool gay_bowser_usbgadget_userclient::initWithTask(task_t owningTask, void *secu
                                               UInt32 type, OSDictionary *properties) {
     LogD("Executing 'gay_bowser_usbgadget_userclient::initWithTask()'.");
     
+    // I7 decision: this client stays available to local tasks. Its only
+    // selector (Poke) re-applies the stored configuration and carries no
+    // caller-supplied data; configuration writes cross the registry-property
+    // boundary, which IOKit policy owns. See docs/kext-audit.md.
     m_provider = nullptr;
     m_providerLock = nullptr;
     

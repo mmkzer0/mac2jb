@@ -104,23 +104,6 @@ gay_bowser_usbgadget::setDictionaryDictionary(const char * symbol,
 	return dictionary->setObject(symbol, value);
 }
 
-bool gay_bowser_usbgadget::setConfigurationDict(OSDictionary* pDict)
-{
-    if (!pDict) return false;
-    
-    OSDictionary *copy = OSDictionary::withDictionary(pDict);
-    if (!copy) return false;
-    
-    IOLockLock(m_pokeLock);
-    OSDictionary *old = m_configuration;
-    m_configuration = copy;
-    IOLockUnlock(m_pokeLock);
-    
-    if (old)
-        old->release();
-    return true;
-}
-
 void gay_bowser_usbgadget::triggerUpdate()
 {
     //m_commandGate->runCommand(NULL);
@@ -129,27 +112,52 @@ void gay_bowser_usbgadget::triggerUpdate()
     IOLockUnlock(m_pokeLock);
 }
 
-// Called with m_pokeLock held (from threadMain).
+// Called by the worker without m_pokeLock held. Snapshot the configuration and
+// controller under the lock, then drop it around the provider callback.
 void gay_bowser_usbgadget::doUpdate()
 {
-    //setProperty("test", OSString::withCString("updated"));
-    
-    if (!m_configuration) return;
-    
+    OSDictionary *configuration = NULL;
+    IOService *controller = NULL;
+
+    IOLockLock(m_pokeLock);
+    if (m_exitThreads) {
+        m_needsUpdate = false;
+        IOLockUnlock(m_pokeLock);
+        return;
+    }
+    configuration = m_configuration;
+    if (configuration) configuration->retain();
+    controller = m_controller_provider;
+    if (controller) controller->retain();
+    // Consume the pending update before the external call so a poke that arrives
+    // during the callback remains pending. With no controller yet, keep it
+    // pending until start() provides one.
+    if (!configuration || controller) {
+        m_needsUpdate = false;
+    }
+    IOLockUnlock(m_pokeLock);
+
+    if (!configuration || !controller) {
+        if (controller) controller->release();
+        if (configuration) configuration->release();
+        return;
+    }
+
     OSDictionary* pCommandDict = OSDictionary::withCapacity(1);
-    if (!pCommandDict) return;
-    
-    bool built = setDictionaryString("USBDeviceCommand", "SetDeviceConfiguration", pCommandDict) &&
-        setDictionaryDictionary("USBDeviceCommandParameter", m_configuration, pCommandDict);
-    
-    // debug
-    //setProperty("DeviceDescription", pCommandDict);
-    
-    // Send it off to IOUSBDeviceInterface
-    if (built && m_controller_provider)
-        m_controller_provider->setProperties(pCommandDict);
-    
-    pCommandDict->release();
+    bool built = pCommandDict &&
+        setDictionaryString("USBDeviceCommand", "SetDeviceConfiguration", pCommandDict) &&
+        setDictionaryDictionary("USBDeviceCommandParameter", configuration, pCommandDict);
+
+    if (built) {
+        IOReturn result = controller->setProperties(pCommandDict);
+        if (result != kIOReturnSuccess) {
+            LogD("Controller setProperties failed in 'gay_bowser_usbgadget:doUpdate()' (0x%x).", result);
+        }
+    }
+
+    if (pCommandDict) pCommandDict->release();
+    controller->release();
+    configuration->release();
 }
 
 void gay_bowser_usbgadget::threadMain()
@@ -159,8 +167,9 @@ void gay_bowser_usbgadget::threadMain()
     {
         if (m_needsUpdate)
         {
+            IOLockUnlock(m_pokeLock);
             doUpdate();
-            m_needsUpdate = false;
+            IOLockLock(m_pokeLock);
         }
         IOLockUnlock(m_pokeLock);
 
@@ -278,14 +287,14 @@ bool gay_bowser_usbgadget::init(OSDictionary *dictionary) {
     
     thread_t thread = THREAD_NULL;
     kern_return_t kr = kernel_thread_start(thread_bootstrap, this, &thread);
-    if( kr != KERN_SUCCESS )
+    if (kr != KERN_SUCCESS)
     {
         LogD("Failed to start thread in 'gay_bowser_usbgadget:init()' (%x).", kr);
+        IOLockFree(m_pokeLock);
+        m_pokeLock = NULL;
+        return false;
     }
-    else
-    {
-        m_thread = thread;
-    }
+    m_thread = thread;
     
     return true;
 }
@@ -340,63 +349,87 @@ void gay_bowser_usbgadget::stopThread() {
 
 IOReturn gay_bowser_usbgadget::setProperties(OSObject *props_obj)
 {
-    IOReturn        return_value = kIOReturnSuccess;
-	OSDictionary    *dict = OSDynamicCast(OSDictionary, props_obj);
-	OSCollectionIterator* iter = NULL;
+    OSDictionary *dict = OSDynamicCast(OSDictionary, props_obj);
+    if (!dict) {
+        return kIOReturnBadArgument;
+    }
 
-	if (!dict) {
-		return kIOReturnBadArgument;
-	}
+    const OSSymbol *publish_configuration_string = OSSymbol::withCString("PublishConfiguration");
+    const OSSymbol *poke_string = OSSymbol::withCString("Poke");
+    if (!publish_configuration_string || !poke_string) {
+        if (publish_configuration_string) publish_configuration_string->release();
+        if (poke_string) poke_string->release();
+        return kIOReturnNoMemory;
+    }
 
-	const OSSymbol* publish_configuration_string        = OSSymbol::withCString("PublishConfiguration");
-    const OSSymbol* poke_string        = OSSymbol::withCString("Poke");
+    OSCollectionIterator *iter = OSCollectionIterator::withCollection(dict);
+    if (!iter) {
+        publish_configuration_string->release();
+        poke_string->release();
+        return kIOReturnNoMemory;
+    }
 
-	if (publish_configuration_string && poke_string) {
-		iter = OSCollectionIterator::withCollection(dict);
-	}
-	if (!iter) {
-		if (publish_configuration_string)
-			publish_configuration_string->release();
-		if (poke_string)
-			poke_string->release();
-		return kIOReturnNoMemory;
-	}
+    IOReturn return_value = kIOReturnSuccess;
+    OSDictionary *publish_value = NULL;
+    bool poke = false;
 
-	OSObject *raw;
-	while ((raw = iter->getNextObject())) {
-		const OSSymbol *key = OSDynamicCast(OSSymbol, raw);
-		if (!key) {
-			continue;
-		}
-		OSObject *obj = dict->getObject(key);
-		if (!obj) {
-			continue;
-		}
+    // Validate the complete dictionary before changing any state.
+    OSObject *raw;
+    while ((raw = iter->getNextObject())) {
+        const OSSymbol *key = OSDynamicCast(OSSymbol, raw);
+        if (!key) {
+            return_value = kIOReturnBadArgument;
+            break;
+        }
+        OSObject *obj = dict->getObject(key);
+        if (!obj) {
+            return_value = kIOReturnBadArgument;
+            break;
+        }
 
-		if (key->isEqualTo(publish_configuration_string)) {
-            OSDictionary* value = OSDynamicCast(OSDictionary, obj);
-			if (value) {
-                if (!setConfigurationDict(value)) {
-                    return_value = kIOReturnNoMemory;
-                    break;
-                }
-                
-				setProperty(key, obj);
-			}
-			else {
-				return_value = kIOReturnBadArgument;
-			}
-		}
-        else if (key->isEqualTo(poke_string)) {
-            triggerUpdate();
-		}
-        else {
-			LogD("setProperties(%s) not handled\n", key->getCStringNoCopy());
-		}
-	}
+        if (key->isEqualTo(publish_configuration_string)) {
+            publish_value = OSDynamicCast(OSDictionary, obj);
+            if (!publish_value) {
+                return_value = kIOReturnBadArgument;
+                break;
+            }
+        } else if (key->isEqualTo(poke_string)) {
+            // The unprivileged host sends CFSTR("Poke").
+            if (!OSDynamicCast(OSString, obj)) {
+                return_value = kIOReturnBadArgument;
+                break;
+            }
+            poke = true;
+        } else {
+            return_value = kIOReturnBadArgument;
+            break;
+        }
+    }
+    iter->release();
 
-	iter->release();
-	publish_configuration_string->release();
-	poke_string->release();
-	return return_value;
+    // Publish before committing the private copy so a failed registry write
+    // leaves both the service property and m_configuration unchanged.
+    if (return_value == kIOReturnSuccess && publish_value) {
+        OSDictionary *copy = OSDictionary::withDictionary(publish_value);
+        if (!copy) {
+            return_value = kIOReturnNoMemory;
+        } else if (!setProperty(publish_configuration_string, publish_value)) {
+            copy->release();
+            return_value = kIOReturnNoMemory;
+        } else {
+            IOLockLock(m_pokeLock);
+            OSDictionary *old = m_configuration;
+            m_configuration = copy;
+            IOLockUnlock(m_pokeLock);
+            if (old) old->release();
+        }
+    }
+
+    if (return_value == kIOReturnSuccess && poke) {
+        triggerUpdate();
+    }
+
+    publish_configuration_string->release();
+    poke_string->release();
+    return return_value;
 }

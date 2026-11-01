@@ -1,6 +1,6 @@
-# Kext verification options (S1 decision record)
+# Kext verification options (S1/S1.1 decision record)
 
-Status: decision record after the S1 audit and two research passes.
+Status: decision record after the S1/S1.1 audit and two research passes.
 Sources:
 
 - SQLite testing review: read-only inspection of `github.com/sqlite/sqlite` at
@@ -25,6 +25,11 @@ Sources:
   the last 32 shim calls on failure; a worker call after `stop()`/`free()`
   returns, a running worker, unbalanced lock/unlock, and a use-after-free lock
   are violations. `IOSleepWithLeeway` and lock operations use a seeded jitter.
+- **S1.1 boundary and reentrancy checks.** A failed worker start fails `init`;
+  unknown property keys and non-`OSString` Poke values are rejected; a failed
+  registry publication leaves both the property and the private copy unchanged.
+  The provider callback runs outside `m_pokeLock` with retained snapshots, and a
+  synchronous reentrant callback must not deadlock or lose the pending poke.
 - **Lifecycle permutations with a live-object baseline.** Every ordering of
   start/stop/stopThread/free and the user-client orderings must return the
   object/lock/thread counters to baseline. This is the SQLite post-run
@@ -116,9 +121,9 @@ Sources:
 
 ## Verification status
 
-- Harness: 20 tests, pass under ASan+UBSan and TSan (~5.7 s).
+- Harness: 21 tests, pass under ASan+UBSan and TSan (~5.75 s).
 - Strict source gate: pass.
-- Final artifact: 114400 bytes, SHA-256
-  `41f650949afcecf9bd730212d55a2ee3254c7c748962d5ebb2d81e86ed8546cf`.
+- Final artifact: 114336 bytes, SHA-256
+  `e8e82a5794b50a9ab4ec8bfd2944848189e4c93ba2a8e53c946ccff7e8a11d8e`.
 - Not yet: iterator-creation and second-`getNextObject` sweep sites, tagged
   registry, two-tier self-check, coverage, mutation, TLA+ model.

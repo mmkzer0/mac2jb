@@ -108,6 +108,7 @@ class FakeController : public IOService {
             entered = true;
             wait_until([this] { return gate_open.load(); }, 3000);
         }
+        if (on_set_properties) on_set_properties();
         return IOService::setProperties(props);
     }
 
@@ -128,6 +129,7 @@ class FakeController : public IOService {
     std::atomic<bool> block;
     std::atomic<bool> entered;
     std::atomic<bool> gate_open;
+    std::function<void()> on_set_properties;
 
   private:
     std::mutex mu;
@@ -167,6 +169,14 @@ OSDictionary *make_props(const char *key, OSObject *value) {
     OSDictionary *d = OSDictionary::withCapacity(1);
     if (d) d->setObject(key, value);
     return d;
+}
+
+// The unprivileged host sends CFSTR("Poke") as the value, not a boolean.
+OSDictionary *make_poke_props() {
+    OSString *value = OSString::withCString("Poke");
+    OSDictionary *props = make_props("Poke", value);
+    if (value) value->release();
+    return props;
 }
 
 IOReturn poke(gay_bowser_usbgadget_userclient *uc) {
@@ -247,14 +257,19 @@ void test_set_properties_validation() {
     CHECK(g->setProperties(empty) == kIOReturnSuccess);
     empty->release();
 
-    // Unknown key: ignored, no state change.
+    // Unknown key: rejected before any state change.
     OSNumber *junk = OSNumber::withNumber(7, 32);
     OSDictionary *unknown = make_props("NoSuchKey", junk);
-    CHECK(g->setProperties(unknown) == kIOReturnSuccess);
+    CHECK(g->setProperties(unknown) == kIOReturnBadArgument);
     CHECK(g->getProperty("NoSuchKey") == NULL);
     CHECK(g->m_configuration == NULL);
     unknown->release();
     junk->release();
+
+    // Poke is the string value the unprivileged host sends; other types are rejected.
+    OSDictionary *bad_poke = make_props("Poke", kOSBooleanTrue);
+    CHECK(g->setProperties(bad_poke) == kIOReturnBadArgument);
+    bad_poke->release();
 
     // Non-dictionary PublishConfiguration: rejected, nothing published.
     OSDictionary *bad = make_props("PublishConfiguration", not_a_dict);
@@ -291,6 +306,32 @@ void test_set_properties_validation() {
     CHECK(g->getProperty("PublishConfiguration") == cfg2);
     bad2->release();
 
+    // Unknown key alongside a valid configuration: reject before applying it.
+    OSNumber *junk2 = OSNumber::withNumber(7, 32);
+    OSDictionary *mixed_valid = OSDictionary::withCapacity(2);
+    mixed_valid->setObject("PublishConfiguration", cfg2);
+    mixed_valid->setObject("NoSuchKey", junk2);
+    CHECK(g->setProperties(mixed_valid) == kIOReturnBadArgument);
+    CHECK(g->m_configuration == kept);
+    CHECK(g->getProperty("PublishConfiguration") == cfg2);
+    mixed_valid->release();
+    junk2->release();
+
+    // A failed registry publish is reported and does not replace the stored copy.
+    OSDictionary *stored_before = g->m_configuration;
+    OSObject *published_before = g->getProperty("PublishConfiguration");
+    fail_next_set_property();
+    OSDictionary *cfg3 = make_config("publish-fail");
+    OSDictionary *good3 = make_props("PublishConfiguration", cfg3);
+    CHECK(g->setProperties(good3) == kIOReturnNoMemory);
+    CHECK(g->m_configuration == stored_before);
+    CHECK(g->getProperty("PublishConfiguration") == published_before);
+    CHECK(g->setProperties(good3) == kIOReturnSuccess);
+    CHECK(g->m_configuration != stored_before);
+    CHECK(g->getProperty("PublishConfiguration") == cfg3);
+    good3->release();
+    cfg3->release();
+
     // Mixed dictionary: unknown + invalid PublishConfiguration + Poke still reports the bad argument.
     OSDictionary *mixed = OSDictionary::withCapacity(3);
     OSNumber *n = OSNumber::withNumber(1, 32);
@@ -301,8 +342,8 @@ void test_set_properties_validation() {
     mixed->release();
     n->release();
 
-    // Poke alone succeeds.
-    OSDictionary *pokeOnly = make_props("Poke", kOSBooleanTrue);
+    // Poke alone, with the host's string value, succeeds.
+    OSDictionary *pokeOnly = make_poke_props();
     CHECK(g->setProperties(pokeOnly) == kIOReturnSuccess);
     pokeOnly->release();
 
@@ -361,7 +402,7 @@ void test_set_properties_oom() {
     // Poke on a gadget with no configuration: the worker's doUpdate returns early and never allocates, so
     // it cannot consume the armed failure.
     gay_bowser_usbgadget *unconfigured = new_gadget();
-    OSDictionary *poke_props = make_props("Poke", kOSBooleanTrue);
+    OSDictionary *poke_props = make_poke_props();
     // Two symbols + iterator.
     sweep_set_properties_oom(unconfigured, poke_props, 3, "poke");
 
@@ -377,39 +418,16 @@ void test_set_properties_oom() {
 // ---------------------------------------------------------------------------
 
 void test_thread_start_failure() {
-    // init succeeds without a worker; start/stop/free complete without a worker to reap.
-    {
-        FakeController *c = new FakeController;
-        fail_next_thread_start();
-        gay_bowser_usbgadget *g = new gay_bowser_usbgadget;
-        CHECK(g->init(NULL));
-        CHECK(g->m_thread == THREAD_NULL);
-        CHECK(g->m_pokeLock != NULL);
-        CHECK(g_stats.threads_started.load() == 0);
-
-        CHECK(g->start(c));
-        CHECK(c->getRetainCount() == 2);
-        OSDictionary *poke_props = make_props("Poke", kOSBooleanTrue);
-        CHECK(g->setProperties(poke_props) == kIOReturnSuccess);
-        poke_props->release();
-        g->stop(c);
-        CHECK(c->getRetainCount() == 1);
-        CHECK(g->m_controller_provider == NULL);
-        CHECK(!g->m_needsUpdate);
-        g->stop(c);  // second stop is also harmless
-        CHECK(c->getRetainCount() == 1);
-        g->release();
-        c->release();
-    }
-    // init succeeds without a worker; free directly (no start, no stop).
-    {
-        fail_next_thread_start();
-        gay_bowser_usbgadget *g = new_gadget();
-        CHECK(g->m_thread == THREAD_NULL);
-        g->release();
-    }
+    // init fails closed when the worker cannot be created; free after the partial
+    // init must release the lock and superclass state exactly once.
+    fail_next_thread_start();
+    gay_bowser_usbgadget *g = new gay_bowser_usbgadget;
+    CHECK(!g->init(NULL));
+    CHECK(g->m_thread == THREAD_NULL);
+    CHECK(g->m_pokeLock == NULL);
     CHECK(g_stats.threads_started.load() == 0);
     CHECK(g_stats.thread_deallocs.load() == 0);
+    g->release();
 }
 
 // ---------------------------------------------------------------------------
@@ -813,12 +831,12 @@ void test_userclient_poke_vs_close() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 7: no deadlock when stop races a poke holding m_pokeLock
+// Test 7: stop waits for an in-flight controller call and does not hold m_pokeLock during it
 // ---------------------------------------------------------------------------
 
-void test_stop_while_poke_holds_lock() {
-    // A: a poke makes the worker call into a slow controller while holding m_pokeLock (doUpdate runs locked);
-    //    stop() and another poke must queue behind it and both complete once the controller returns.
+void test_stop_waits_for_controller() {
+    // A: the worker calls a slow controller outside m_pokeLock; a second poke completes while the
+    //    controller is blocked, and stop() waits for the in-flight update before reaping the worker.
     {
         FakeController *c = new FakeController;
         c->block = true;
@@ -843,8 +861,8 @@ void test_stop_while_poke_holds_lock() {
             poke_done = true;
         });
         sleep_ms(50);
-        CHECK(!stop_done.load());  // cannot finish while the worker holds the lock
-        CHECK(!poke_done.load());
+        CHECK(!stop_done.load());  // waits for the in-flight controller call
+        CHECK(poke_done.load());   // poke is not serialized behind the controller call
         c->gate_open = true;
         stopper.join();
         second_poke.join();
@@ -894,6 +912,40 @@ void test_stop_while_poke_holds_lock() {
         CHECK(done.load());
         uc->release();  // final release of the gadget happens in userclient::free()
     }
+}
+
+// ---------------------------------------------------------------------------
+// Test 7b: a synchronous reentrant controller callback must not deadlock or lose the poke
+// ---------------------------------------------------------------------------
+
+void test_controller_reentrancy() {
+    FakeController *c = new FakeController;
+    gay_bowser_usbgadget *g = new_gadget();
+    gay_bowser_usbgadget_userclient *uc = new_userclient();
+    OSDictionary *cfg = make_config("reentrant");
+    OSDictionary *props = make_props("PublishConfiguration", cfg);
+    CHECK(g->setProperties(props) == kIOReturnSuccess);
+    CHECK(g->start(c));
+    CHECK(uc->start(g));
+
+    std::atomic<int> reentered(0);
+    c->on_set_properties = [&] {
+        if (reentered.fetch_add(1) == 0) g->triggerUpdate();
+    };
+
+    CHECK(poke(uc) == kIOReturnSuccess);
+    CHECK(wait_until([&] { return c->calls.load() >= 2; }, 3000));
+    CHECK(reentered.load() >= 1);
+    CHECK(g_stats.violations.load() == 0);
+    CHECK(g->m_thread != THREAD_NULL);
+
+    uc->clientClose();
+    g->stop(c);
+    uc->release();
+    g->release();
+    c->release();
+    props->release();
+    cfg->release();
 }
 
 // ---------------------------------------------------------------------------
@@ -1002,8 +1054,6 @@ void run_scenario(Teardown td, const SweepFixtures &f, ScenarioResult &r) {
             },
             3000);
     }
-    r.ctrl_calls = c->calls.load();
-
     set_step(kStepTeardown);
     if (td == kTeardownStopFree) {
         uc->clientClose();
@@ -1017,6 +1067,8 @@ void run_scenario(Teardown td, const SweepFixtures &f, ScenarioResult &r) {
         g->release();
         mark_quiescent();
     }
+    // The worker is reaped by stop/free, so this is the final controller-call count.
+    r.ctrl_calls = c->calls.load();
     c->release();
 }
 
@@ -1044,12 +1096,13 @@ bool classify(Op op, bool sticky, bool fired, int fired_step, const ScenarioResu
     }
     EXPECT(r.settled, "worker never finished the pending update");
 
-    // gadget init: every allocation site (properties dictionary, lock) must fail init; thread start must not.
-    const bool init_must_fail = alloc_like && injection_active(fired, sticky, fired_step, kStepInit);
+    // gadget init: every allocation site (properties dictionary, lock) and a failed
+    // thread start must fail init; an uninjected run must start a worker.
+    const bool init_must_fail =
+        injection_active(fired, sticky, fired_step, kStepInit) && (alloc_like || op == kOpThreadStart);
     EXPECT(r.init_ok == !init_must_fail, "init returned %d, expected %d", r.init_ok, !init_must_fail);
     if (!r.init_ok) return true;
-    const bool no_worker = op == kOpThreadStart && injection_active(fired, sticky, fired_step, kStepInit);
-    EXPECT(r.worker_present == !no_worker, "worker_present=%d, expected %d", r.worker_present, !no_worker);
+    EXPECT(r.worker_present, "init succeeded without a worker");
 
     // setProperties: every allocation site must surface kIOReturnNoMemory and must not store the configuration.
     const bool props_must_fail = op == kOpAlloc && injection_active(fired, sticky, fired_step, kStepSetProps);
@@ -1197,7 +1250,8 @@ const TestCase kTests[] = {
     {"6c_userclient_poke_reaches_gadget", test_userclient_poke_reaches_gadget},
     {"6d_userclient_orderings", test_userclient_orderings},
     {"6e_userclient_poke_vs_close", test_userclient_poke_vs_close},
-    {"7_stop_while_poke_holds_lock", test_stop_while_poke_holds_lock},
+    {"7_stop_waits_for_controller", test_stop_waits_for_controller},
+    {"7b_controller_reentrancy", test_controller_reentrancy},
     {"8a_sweep_stop_free_alloc", test_sweep<kTeardownStopFree, kOpAlloc, 10>},
     {"8b_sweep_stop_free_lock_alloc", test_sweep<kTeardownStopFree, kOpLockAlloc, 2>},
     {"8c_sweep_stop_free_thread_start", test_sweep<kTeardownStopFree, kOpThreadStart, 1>},
