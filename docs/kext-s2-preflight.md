@@ -1,9 +1,18 @@
 # S2 preflight (no SIP change)
 
 Status: executed on 2026-11-02. The preflight passes after installing
-`KDK_27.0_26A428.kdk`; the private LocalPolicy is not captured and the S2 policy
-gate has not been applied. No SIP change, install, unload or kext load was
-performed.
+`KDK_27.0_26A428.kdk`; the private LocalPolicy snapshot is captured privately
+and matches the documented baseline. The S2 policy gate has not been applied.
+No SIP change, install, unload or kext load was performed.
+
+**Private policy snapshot (2026-11-02):** one UUID node with 42 fields, mode
+`0600`, stored outside the repository. It confirms `security_mode: permissive`,
+`smb1: true` (Permissive Security), `smb2: false`, `sip0: 0x1014`, and
+`auxp/auxi/auxr` absent. Identifiers and hashes are not reproduced. The live
+`csrutil status` matches the public SIP bits. Because the host is already
+Permissive rather than Full, the plan's "Reduced Security" step must explicitly
+decide whether to tighten to Reduced (`smb1: false`) or accept the existing
+permissive baseline; `smb2: true` remains the missing gate.
 
 This is the pre-load check for the S2 policy gate. It does not replace the
 mock-IOKit harness or the S3 hardware gate.
@@ -47,7 +56,7 @@ rejects `-n`. Use `kmutil print-diagnostics`.
 | Bundle | pass: two files, no symlinks, `Info.plist` lint, arm64e, unsigned as built |
 | Load diagnostics | dependencies OK with the matching KDK; user-owned and unsigned diagnostics are expected pre-install |
 | Current state | `usbgadget` not loaded; target install path absent; `Kext Signing: enabled` |
-| Private LocalPolicy | not captured; requires explicit `--private-policy-out` and approval |
+| Private LocalPolicy | captured privately, mode `0600`, outside the repo; baseline has `smb2:false`, `sip0:0x1014`, Permissive Security |
 | Rollback | documented in `kext-hardening-plan.md`; not executed |
 | SIP / install / load | untouched |
 
@@ -56,15 +65,18 @@ harness logs are next to it. These are local artifacts, not release inputs.
 
 ## Next steps
 
-1. No preflight blockers. Capture the full LocalPolicy privately only after
-   explicit approval; never commit it (it contains ECID, kuid, vuid and policy
-   hashes):
-   `scripts/kext-s2-preflight.sh --private-policy-out "$HOME/private/bputil.json"`.
+1. Decide the policy target. The current snapshot is already Permissive
+   (`smb1:true`, `security_mode:permissive`); the documented target is Reduced
+   Security. Enabling third-party kexts (`smb2:true`) is required either way.
+   Do not treat the target as Reduced without a post-change snapshot showing
+   `smb1:false`.
 2. Then run the one recoveryOS S2 policy session from
    `kext-hardening-plan.md` §7, with explicit approval. The preflight itself
    never changes SIP.
 3. Keep the preflight green: rerun it after any source, toolchain or policy
-   change before a load attempt.
+   change before a load attempt. To refresh the private snapshot after a policy
+   change, use `--private-policy-out` only with explicit approval; never commit
+   it.
 
 ## Early S3 non-root probe
 

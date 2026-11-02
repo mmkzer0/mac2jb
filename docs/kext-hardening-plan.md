@@ -282,8 +282,10 @@ matching KDK, the S1 strict/harness gates, two clean builds for reproducibility,
 bundle and dependency diagnostics, the public SIP state, and rollback
 readiness. It never changes SIP, installs, unloads or loads. The current result
 is recorded in `kext-s2-preflight.md`: the preflight passes with the matching
-KDK; the private LocalPolicy is still uncaptured, so the policy gate itself
-remains pending.
+KDK; the private LocalPolicy snapshot is captured and matches the documented
+Permissive baseline. The policy gate itself remains pending; `smb2:true` is
+still missing, and the Reduced-versus-Permissive target needs an explicit
+decision.
 
 Preconditions: S1 accepted and the preflight report says `PASS: no preflight
 blockers`; a KDK matching macOS 27.0 (build 26A428) installed; full
