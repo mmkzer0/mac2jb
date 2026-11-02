@@ -13,8 +13,10 @@ In scope:
 - Provenance comparison against the shipped `drivers/usbgadget.kext`.
 - Lifetime, ownership, thread and error-path fixes in the kext.
 - A user-space mock-IOKit harness with fault injection for the lifecycle logic.
-- One documented policy change in recoveryOS (Reduced Security + third-party kexts,
-  plus the minimal SIP exceptions), then hardware validation.
+- One documented policy change in recoveryOS (keep the existing Permissive
+  Security, enable third-party kexts, and set the minimal SIP exceptions), then
+  hardware validation. The stricter Reduced variant remains documented as the
+  general alternative.
 
 Out of scope for this plan:
 
@@ -57,9 +59,10 @@ Verified on this machine and from Apple primary sources:
 
 Policy facts (Apple Platform Security):
 
-- Third-party kexts require **Reduced Security** and an explicit opt-in
+- Third-party kexts require **Reduced Security or lower** and an explicit opt-in
   (`smb2` in the LocalPolicy), then a per-kext user approval (UAKL), an AuxKC
-  rebuild and a reboot.
+  rebuild and a reboot. The selected target keeps the already-present Permissive
+  mode; the stricter Reduced variant would also satisfy the requirement.
 - `kmd` validates only UAKL entries for AuxKC inclusion. With SIP enabled the
   signature of each kext is verified before inclusion; with SIP disabled it is not.
 - `bputil -k/--enable-kexts` enables trust in a locally SEP-signed AuxKC and
@@ -112,12 +115,16 @@ Consequences:
   (`--without debug,kext`) are accepted; unknown tokens fail with
   `invalid option %s.`
 
-Target state after S2 (expected):
+Target state after S2 (selected Permissive variant, expected):
 
+- `security_mode: permissive`, `smb1: true` (unchanged)
 - `smb2: true`
-- `sip0 = 0x5` (`kext` + `debug`), or `0x1005` after re-enabling research guests
+- `sip0 = 0x1005` with research guests retained (current state), otherwise
+  `0x5` (`kext` + `debug`)
 - `auxp/auxi/auxr` created on the first kext approval
 - `Kext Signing: disabled`, `Debugging Restrictions: disabled`, everything else enabled
+
+The stricter Reduced variant would use `smb1: false` and the same SIP target.
 
 ## 3. Invariants
 
@@ -284,8 +291,8 @@ readiness. It never changes SIP, installs, unloads or loads. The current result
 is recorded in `kext-s2-preflight.md`: the preflight passes with the matching
 KDK; the private LocalPolicy snapshot is captured and matches the documented
 Permissive baseline. The policy gate itself remains pending; `smb2:true` is
-still missing, and the Reduced-versus-Permissive target needs an explicit
-decision.
+still missing. On 2026-11-02 the target was selected as **keep Permissive +
+enable kexts**; Reduced is not pursued.
 
 Preconditions: S1 accepted and the preflight report says `PASS: no preflight
 blockers`; a KDK matching macOS 27.0 (build 26A428) installed; full
@@ -295,14 +302,20 @@ public issue).
 Steps, in this order:
 
 1. Enter recoveryOS/1TR.
-2. Enable third-party kexts: Startup Security Utility → Reduced Security +
-   "Allow user management of kernel extensions from identified developers"
-   (or `bputil -k`, which also downgrades to Reduced Security). Goal: `smb2: true`.
+2. Keep the selected Permissive mode and enable third-party kexts: Startup
+   Security Utility → Permissive Security + "Allow user management of kernel
+   extensions from identified developers". Goal: `security_mode: permissive`,
+   `smb1: true`, `smb2: true`. If the checkbox is unavailable under Permissive,
+   run `bputil -k` to enable kexts, then verify the resulting mode; if it
+   changes to Reduced, re-select Permissive and re-check `smb2`. The general
+   alternative remains Reduced Security + the same checkbox.
 3. Set the minimal SIP mask: `csrutil enable --without debug,kext`
    (alternative spelling: `--without debug --without kext`).
    Expected `sip0 = 0x5`.
-4. Re-enable research guests if they are needed: `csrutil allow-research-guests enable`
-   (expected `sip0 = 0x1005`).
+4. Re-enable research guests if they are needed:
+   `csrutil allow-research-guests enable` (expected `sip0 = 0x1005`). The current
+   policy has research guests enabled; keep them unless they are no longer
+   required.
 5. Restart.
 
 Verification after boot:
@@ -310,8 +323,8 @@ Verification after boot:
 - `csrutil status` → `Kext Signing: disabled`, `Debugging Restrictions: disabled`,
   all other protections enabled, `Authenticated Root: enabled`.
 - `csrutil allow-research-guests status`.
-- `sudo bputil -d -j` → `smb2: true`, `sip0` as expected, `auxp/auxi/auxr` still
-  absent until the kext is approved.
+- `sudo bputil -d -j` → `security_mode: permissive`, `smb1: true`, `smb2: true`,
+  `sip0` as expected, `auxp/auxi/auxr` still absent until the kext is approved.
 - `spctl kext-consent list` before and after approval.
 
 Open empirical question (the only one that can invalidate the plan):
@@ -327,7 +340,8 @@ Open empirical question (the only one that can invalidate the plan):
 
 Acceptance:
 
-- `smb2: true`, expected `sip0`, research guests state recorded.
+- `security_mode: permissive`, `smb1: true`, `smb2: true`, expected `sip0`,
+  research guests state recorded.
 - Negative control captured: what `kmutil load -p` reports for the shipped
   unsigned kext before the policy change (expected: policy/signature failure).
 

@@ -9,10 +9,10 @@ No SIP change, install, unload or kext load was performed.
 `0600`, stored outside the repository. It confirms `security_mode: permissive`,
 `smb1: true` (Permissive Security), `smb2: false`, `sip0: 0x1014`, and
 `auxp/auxi/auxr` absent. Identifiers and hashes are not reproduced. The live
-`csrutil status` matches the public SIP bits. Because the host is already
-Permissive rather than Full, the plan's "Reduced Security" step must explicitly
-decide whether to tighten to Reduced (`smb1: false`) or accept the existing
-permissive baseline; `smb2: true` remains the missing gate.
+`csrutil status` matches the public SIP bits. The selected target is to
+keep Permissive (`smb1:true`) and add `smb2:true`; the expected SIP mask is
+`0x1005` with research guests retained, otherwise `0x5`. `smb2:true` remains the
+missing gate; Reduced is not pursued.
 
 This is the pre-load check for the S2 policy gate. It does not replace the
 mock-IOKit harness or the S3 hardware gate.
@@ -65,12 +65,10 @@ harness logs are next to it. These are local artifacts, not release inputs.
 
 ## Next steps
 
-1. Decide the policy target. The current snapshot is already Permissive
-   (`smb1:true`, `security_mode:permissive`); the documented target is Reduced
-   Security. Enabling third-party kexts (`smb2:true`) is required either way.
-   Do not treat the target as Reduced without a post-change snapshot showing
-   `smb1:false`.
-2. Then run the one recoveryOS S2 policy session from
+1. Selected target: keep Permissive (`smb1:true`) and enable third-party kexts
+   (`smb2:true`). Set the SIP mask to `0x1005` with research guests retained
+   (current) or `0x5` without them.
+2. Run the one recoveryOS S2 policy session from
    `kext-hardening-plan.md` §7, with explicit approval. The preflight itself
    never changes SIP.
 3. Keep the preflight green: rerun it after any source, toolchain or policy

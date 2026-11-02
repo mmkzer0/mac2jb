@@ -128,7 +128,8 @@ Sources:
 - Final artifact: 114360 bytes, SHA-256
   `644fda29022f7152ab11c029b4bf342160180af364ce8748ad965a0bd0626fd0`.
 - S2 preflight: pass with `KDK_27.0_26A428.kdk`; private LocalPolicy captured
-  privately (Permissive baseline, `smb2:false`); no SIP change, install or load.
+  privately. Selected target is Permissive + kexts (`smb1:true`, `smb2:true`,
+  `sip0=0x1005` with research guests); no SIP change, install or load yet.
 - Not yet: iterator-creation and second-`getNextObject` sweep sites, tagged
   registry, two-tier self-check, coverage, mutation, TLA+ model. The early-S3
   non-root registry probe runs after the kext is loaded, not before.
