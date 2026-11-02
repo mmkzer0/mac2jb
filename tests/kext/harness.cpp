@@ -425,6 +425,7 @@ void test_thread_start_failure() {
     CHECK(!g->init(NULL));
     CHECK(g->m_thread == THREAD_NULL);
     CHECK(g->m_pokeLock == NULL);
+    CHECK(g->m_configLock == NULL);
     CHECK(g_stats.threads_started.load() == 0);
     CHECK(g_stats.thread_deallocs.load() == 0);
     g->release();
@@ -538,7 +539,7 @@ void test_lifecycle_permutations() {
             g->release();
         }
         CHECK(completed);
-        CHECKF(sites >= 2, "only %d init allocation sites exercised", sites);
+        CHECKF(sites >= 3, "only %d init allocation sites exercised", sites);
     }
     // super::init failure then free
     {
@@ -546,6 +547,7 @@ void test_lifecycle_permutations() {
         fail_next_super_init();
         CHECK(!g->init(NULL));
         CHECK(g->m_pokeLock == NULL);
+        CHECK(g->m_configLock == NULL);
         CHECK(g->m_thread == THREAD_NULL);
         g->release();
     }
@@ -949,6 +951,90 @@ void test_controller_reentrancy() {
 }
 
 // ---------------------------------------------------------------------------
+// Test 7c: two PublishConfiguration writers must not interleave registry and private commit
+// ---------------------------------------------------------------------------
+
+struct PublishGate {
+    std::atomic<bool> first_entered{false};
+    std::atomic<bool> release_first{false};
+    std::atomic<bool> hung{false};
+    std::atomic<int> calls{0};
+};
+
+void publish_observer(const OSSymbol *, bool applied, void *context) {
+    if (!applied) return;
+    PublishGate *gate = static_cast<PublishGate *>(context);
+    const int call = gate->calls.fetch_add(1) + 1;
+    if (call == 1) {
+        gate->first_entered = true;
+        // Hold the first writer inside the registry write, after it applied the
+        // value and before it returns to commit the private configuration.
+        if (!wait_until([gate] { return gate->release_first.load(); }, 1000)) {
+            gate->hung = true;
+        }
+    }
+}
+
+void test_concurrent_publish() {
+    gay_bowser_usbgadget *g = new_gadget();
+    OSDictionary *cfg_a = make_config("publish-A");
+    OSDictionary *cfg_b = make_config("publish-B");
+    OSDictionary *props_a = make_props("PublishConfiguration", cfg_a);
+    OSDictionary *props_b = make_props("PublishConfiguration", cfg_b);
+    PublishGate gate;
+    set_set_property_observer(publish_observer, &gate);
+
+    IOReturn rc_a = kIOReturnSuccess;
+    IOReturn rc_b = kIOReturnSuccess;
+    std::atomic<bool> b_started(false), b_done(false);
+    std::thread a([&] { rc_a = g->setProperties(props_a); });
+    CHECK(wait_until([&] { return gate.first_entered.load(); }, 3000));
+
+    std::thread b([&] {
+        b_started = true;
+        rc_b = g->setProperties(props_b);
+        b_done = true;
+    });
+    CHECK(wait_until([&] { return b_started.load(); }, 3000));
+
+    // A serialized implementation blocks B until A has committed. If B completes
+    // here, it has published B and then A will overwrite the private copy with A.
+    const bool b_completed_early = wait_until([&] { return b_done.load(); }, 500);
+    CHECKF(!b_completed_early,
+           "second PublishConfiguration completed while the first was between registry write and private commit");
+
+    gate.release_first = true;
+    a.join();
+    b.join();
+    set_set_property_observer(NULL, NULL);
+    CHECK(!gate.hung.load());
+    CHECK(rc_a == kIOReturnSuccess);
+    CHECK(rc_b == kIOReturnSuccess);
+
+    OSDictionary *published = OSDynamicCast(OSDictionary, g->getProperty("PublishConfiguration"));
+    CHECK(published != NULL);
+    CHECK(g->m_configuration != NULL);
+    if (published && g->m_configuration) {
+        OSString *published_serial = OSDynamicCast(OSString, published->getObject("serialNumber"));
+        OSString *private_serial = OSDynamicCast(OSString, g->m_configuration->getObject("serialNumber"));
+        CHECK(published_serial != NULL);
+        CHECK(private_serial != NULL);
+        if (published_serial && private_serial) {
+            CHECKF(strcmp(published_serial->getCStringNoCopy(), "publish-B") == 0,
+                   "registry retained serial '%s'", published_serial->getCStringNoCopy());
+            CHECKF(strcmp(private_serial->getCStringNoCopy(), "publish-B") == 0,
+                   "private configuration retained serial '%s'", private_serial->getCStringNoCopy());
+        }
+    }
+
+    props_b->release();
+    props_a->release();
+    cfg_b->release();
+    cfg_a->release();
+    g->release();
+}
+
+// ---------------------------------------------------------------------------
 // Failure sweeps: arm a failure at the nth shim-mediated operation of one kind, for n = 1, 2, ... until a run
 // injects nothing, once one-shot (fail once) and once sticky (fail that and every later operation).
 // Every trial replays the same fixed scenario in a freshly reset shim world with a trial-specific RNG seed.
@@ -1252,6 +1338,7 @@ const TestCase kTests[] = {
     {"6e_userclient_poke_vs_close", test_userclient_poke_vs_close},
     {"7_stop_waits_for_controller", test_stop_waits_for_controller},
     {"7b_controller_reentrancy", test_controller_reentrancy},
+    {"7c_concurrent_publish", test_concurrent_publish},
     {"8a_sweep_stop_free_alloc", test_sweep<kTeardownStopFree, kOpAlloc, 10>},
     {"8b_sweep_stop_free_lock_alloc", test_sweep<kTeardownStopFree, kOpLockAlloc, 2>},
     {"8c_sweep_stop_free_thread_start", test_sweep<kTeardownStopFree, kOpThreadStart, 1>},

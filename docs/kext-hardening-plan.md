@@ -123,8 +123,8 @@ Target state after S2 (expected):
 
 Kext (must hold on every path):
 
-- I1 No null/uninitialized dereference: `m_pokeLock`, `m_thread`, `iter`,
-  `pCommandDict`, `pDict`.
+- I1 No null/uninitialized dereference: `m_pokeLock`,
+  `m_configLock`, `m_thread`, `iter`, `pCommandDict`, `pDict`.
 - I2 `m_provider` outlives every user-client call: retain in `start`, release in
   `stop`/`clientClose`; `initWithTask` rejects clients that must not exist.
 - I3 `m_configuration` is replaced and released under `m_pokeLock` only, and is
@@ -145,6 +145,10 @@ Kext (must hold on every path):
 - I10 No teardown deadlock: never wait for `m_threadDone` while holding a lock
   the worker needs to make progress; teardown order is client, provider, thread,
   lock.
+- I11 Publication atomicity: the `PublishConfiguration` registry write and the
+  private `m_configuration` commit are serialized by `m_configLock`; the worker
+  only swaps/reads under `m_pokeLock`, and the lock order is publication then
+  poke.
 
 Host:
 
@@ -272,8 +276,17 @@ Acceptance:
 
 ## 7. S2 — policy gate (one recoveryOS session)
 
-Preconditions: S1 accepted; a KDK matching macOS 27.0 (build 26A428) installed;
-full `bputil -d -j` output stored privately (not in the repository, not in a
+Preflight (no policy change): run `scripts/kext-s2-preflight.sh` and keep the
+report in `build/kext-s2-preflight/`. The script checks the host/toolchain, the
+matching KDK, the S1 strict/harness gates, two clean builds for reproducibility,
+bundle and dependency diagnostics, the public SIP state, and rollback
+readiness. It never changes SIP, installs, unloads or loads. The current result
+is recorded in `kext-s2-preflight.md`; it is blocked by the missing matching
+KDK and must not be treated as a green S2 gate.
+
+Preconditions: S1 accepted and the preflight report says `PASS: no preflight
+blockers`; a KDK matching macOS 27.0 (build 26A428) installed; full
+`bputil -d -j` output stored privately (not in the repository, not in a
 public issue).
 
 Steps, in this order:
@@ -324,11 +337,16 @@ Order:
 2. Approve it in System Settings → Privacy & Security; wait for the AuxKC rebuild;
    reboot.
 3. `kmutil showloaded --list-only | grep usbgadget` and `kmutil showloaded --show-kernel`.
-4. Boundary tests: repeated load/unload cycles, poke storm from a second
+4. Early S3 non-root boundary probe: from an unprivileged account, write a
+   valid `PublishConfiguration` and `Poke` through the host's
+   `IORegistryEntrySetCFProperties` path, record whether it is accepted, attempt
+   an unknown key and record the rejection. This runs only after the kext is
+   loaded and is not a pre-load gate.
+5. Boundary tests: repeated load/unload cycles, poke storm from a second
    process, `setProperties` during teardown, unplug during active transfers.
-5. Functional test: mac2jb typing flow against the Switch with the kurumuz host,
+6. Functional test: mac2jb typing flow against the Switch with the kurumuz host,
    up to 4/4 verification.
-6. Capture `log show` for the kext subsystem and any panic report.
+7. Capture `log show` for the kext subsystem and any panic report.
 
 Rollback (unload is not removal):
 
@@ -350,6 +368,8 @@ Mac restarts. Rollback therefore needs two separate proofs:
 Acceptance:
 
 - Kext loads from the reviewed build, the typing flow works, no panic.
+- The early non-root probe results are recorded: accepted host path,
+  rejected unknown key.
 - Every rollback step executed at least once and documented.
 
 ## 9. Risks and open questions

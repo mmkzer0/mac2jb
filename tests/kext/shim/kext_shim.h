@@ -15,6 +15,8 @@
 #include <type_traits>
 #include <vector>
 
+class OSSymbol;
+
 typedef uint32_t UInt32;
 typedef uint32_t IOOptionBits;
 typedef int kern_return_t;
@@ -118,6 +120,10 @@ void fail_next_super_init();
 void fail_next_super_start();
 void fail_next_super_init_with_task();
 void fail_next_set_property();
+// Test-only observation point after IOService::setProperty applies the value and
+// before it returns. Used to force a deterministic two-writer publication race.
+using SetPropertyObserver = void (*)(const OSSymbol *key, bool applied, void *context);
+void set_set_property_observer(SetPropertyObserver observer, void *context);
 
 // Seeded scheduling/timing RNG: jitters IOSleepWithLeeway and inserts yields around lock operations.
 // Seed 0 (the initial state) disables jitter.

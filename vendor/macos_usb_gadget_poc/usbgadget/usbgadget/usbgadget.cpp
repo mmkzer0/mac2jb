@@ -247,6 +247,7 @@ bool gay_bowser_usbgadget::init(OSDictionary *dictionary) {
     m_controller_provider = NULL;
     m_configuration = NULL;
     m_pokeLock = NULL;
+    m_configLock = NULL;
     m_thread = THREAD_NULL;
     m_threadDone = false;
     m_needsUpdate = false;
@@ -296,12 +297,22 @@ bool gay_bowser_usbgadget::init(OSDictionary *dictionary) {
         LogD("Failed to allocate lock in 'gay_bowser_usbgadget:init()'.");
         return false;
     }
+
+    m_configLock = IOLockAlloc();
+    if (!m_configLock) {
+        LogD("Failed to allocate config lock in 'gay_bowser_usbgadget:init()'.");
+        IOLockFree(m_pokeLock);
+        m_pokeLock = NULL;
+        return false;
+    }
     
     thread_t thread = THREAD_NULL;
     kern_return_t kr = kernel_thread_start(thread_bootstrap, this, &thread);
     if (kr != KERN_SUCCESS)
     {
         LogD("Failed to start thread in 'gay_bowser_usbgadget:init()' (%x).", kr);
+        IOLockFree(m_configLock);
+        m_configLock = NULL;
         IOLockFree(m_pokeLock);
         m_pokeLock = NULL;
         return false;
@@ -326,6 +337,11 @@ void gay_bowser_usbgadget::free() {
         m_configuration = NULL;
     }
     
+    if (m_configLock) {
+        IOLockFree(m_configLock);
+        m_configLock = NULL;
+    }
+
     if (m_pokeLock) {
         IOLockFree(m_pokeLock);
         m_pokeLock = NULL;
@@ -420,20 +436,31 @@ IOReturn gay_bowser_usbgadget::setProperties(OSObject *props_obj)
     iter->release();
 
     // Publish before committing the private copy so a failed registry write
-    // leaves both the service property and m_configuration unchanged.
+    // leaves both the service property and m_configuration unchanged. The
+    // dedicated publication lock serializes the registry write with the private
+    // commit: a second publish cannot interleave and leave them divergent.
     if (return_value == kIOReturnSuccess && publish_value) {
         OSDictionary *copy = OSDictionary::withDictionary(publish_value);
         if (!copy) {
             return_value = kIOReturnNoMemory;
-        } else if (!setProperty(publish_configuration_string, publish_value)) {
-            copy->release();
-            return_value = kIOReturnNoMemory;
         } else {
-            IOLockLock(m_pokeLock);
-            OSDictionary *old = m_configuration;
-            m_configuration = copy;
-            IOLockUnlock(m_pokeLock);
-            if (old) old->release();
+            OSDictionary *old = NULL;
+            IOLockLock(m_configLock);
+            bool published = setProperty(publish_configuration_string, publish_value);
+            if (published) {
+                IOLockLock(m_pokeLock);
+                old = m_configuration;
+                m_configuration = copy;
+                IOLockUnlock(m_pokeLock);
+            }
+            IOLockUnlock(m_configLock);
+
+            if (!published) {
+                copy->release();
+                return_value = kIOReturnNoMemory;
+            } else if (old) {
+                old->release();
+            }
         }
     }
 

@@ -60,8 +60,9 @@ Sources:
   `setProperties` lines and require the harness to kill each mutant. SQLite
   TH3's mutation test is the reference; start with the teardown paths.
 - **S2 diagnostics.** `kmutil`/`kextutil` bundle and linkage diagnostics before
-  loading, the matching KDK check, and a non-root probe for the IOKit registry
-  property gate.
+  loading, the matching KDK check, and reproducible-build verification, driven
+  by `scripts/kext-s2-preflight.sh`. The non-root IOKit registry-property probe
+  belongs to early S3, after the kext is loaded, and is not a pre-load gate.
 
 ## Formal experiment (bounded, not S1)
 
@@ -121,9 +122,11 @@ Sources:
 
 ## Verification status
 
-- Harness: 21 tests, pass under ASan+UBSan and TSan (~5.75 s).
+- Harness: 22 tests, pass under ASan+UBSan and TSan (~7.1 s); 30 ASan+UBSan
+  and 10 TSan full-suite stress loops passed.
 - Strict source gate: pass.
-- Final artifact: 114344 bytes, SHA-256
-  `6d6dbef5b2e0b2417aa35bbf1822d7078076149a1e28d72284ee76be7c7e609e`.
+- Final artifact: 114360 bytes, SHA-256
+  `644fda29022f7152ab11c029b4bf342160180af364ce8748ad965a0bd0626fd0`.
 - Not yet: iterator-creation and second-`getNextObject` sweep sites, tagged
-  registry, two-tier self-check, coverage, mutation, TLA+ model.
+  registry, two-tier self-check, coverage, mutation, TLA+ model. The early-S3
+  non-root registry probe runs after the kext is loaded, not before.

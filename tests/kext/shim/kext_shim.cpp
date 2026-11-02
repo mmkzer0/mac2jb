@@ -28,6 +28,8 @@ OpFault g_ops[kOpCount];
 std::atomic<int> g_step(0);
 std::atomic<uint64_t> g_rng(0);
 std::atomic<bool> g_quiescent(false);
+std::atomic<SetPropertyObserver> g_set_property_observer(nullptr);
+std::atomic<void *> g_set_property_observer_context(nullptr);
 
 const unsigned kTraceSize = 256;
 
@@ -75,6 +77,8 @@ void reset() {
     g_faults.super_start = false;
     g_faults.super_init_with_task = false;
     g_faults.super_set_property = false;
+    g_set_property_observer = nullptr;
+    g_set_property_observer_context = nullptr;
     g_sleep_cap_ms = 2;
     g_step = 0;
     g_quiescent = false;
@@ -152,6 +156,18 @@ void fail_next_super_init() { g_faults.super_init = true; }
 void fail_next_super_start() { g_faults.super_start = true; }
 void fail_next_super_init_with_task() { g_faults.super_init_with_task = true; }
 void fail_next_set_property() { g_faults.super_set_property = true; }
+
+void set_set_property_observer(SetPropertyObserver observer, void *context) {
+    g_set_property_observer_context = context;
+    g_set_property_observer = observer;
+}
+
+void notify_set_property(const OSSymbol *key, bool applied) {
+    SetPropertyObserver observer = g_set_property_observer.load(std::memory_order_acquire);
+    if (observer) {
+        observer(key, applied, g_set_property_observer_context.load(std::memory_order_acquire));
+    }
+}
 
 void seed_rng(uint64_t seed) { g_rng = seed; }
 
@@ -748,20 +764,24 @@ void IOService::registerService(IOOptionBits options) {
 bool IOService::setProperty(const OSSymbol *key, OSObject *value) {
     if (consume(g_faults.super_set_property)) {
         trace_event("IOService::setProperty", 0);
+        notify_set_property(key, false);
         return false;
     }
     bool ok = properties_ && properties_->setObject(key, value);
     trace_event("IOService::setProperty", ok);
+    notify_set_property(key, ok);
     return ok;
 }
 
 bool IOService::setProperty(const char *key, OSObject *value) {
     if (consume(g_faults.super_set_property)) {
         trace_event("IOService::setProperty", 0);
+        notify_set_property(NULL, false);
         return false;
     }
     bool ok = properties_ && properties_->setObject(key, value);
     trace_event("IOService::setProperty", ok);
+    notify_set_property(NULL, ok);
     return ok;
 }
 

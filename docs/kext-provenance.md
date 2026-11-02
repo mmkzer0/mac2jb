@@ -41,9 +41,9 @@ xcodebuild -project usbgadget.xcodeproj -configuration Debug -sdk macosx \
 ## Artifacts
 
 - Built: `build/kext/usbgadget.kext`
-  - Total size: 116600 bytes
-  - Executable: `Contents/MacOS/usbgadget` (114344 bytes)
-    - SHA256: `6d6dbef5b2e0b2417aa35bbf1822d7078076149a1e28d72284ee76be7c7e609e`
+  - Total size: 116616 bytes
+  - Executable: `Contents/MacOS/usbgadget` (114360 bytes)
+    - SHA256: `644fda29022f7152ab11c029b4bf342160180af364ce8748ad965a0bd0626fd0`
   - Info.plist: `Contents/Info.plist` (2256 bytes)
     - SHA256: `a4ca368ce107273aaf008a8dd68d1de898eb9889c5efc6e56ea76601912ce0bd`
 - Shipped: `drivers/usbgadget.kext`
@@ -90,9 +90,9 @@ xcodebuild -project usbgadget.xcodeproj -configuration Debug -sdk macosx \
   - `__DATA_CONST,__auth_got`: built 216 bytes, shipped 200 bytes (+16 bytes)
   - `__DATA_CONST,__const`: built 5288 bytes, shipped 5296 bytes (-8 bytes)
   - `__DATA_CONST,__got`: built 80 bytes, shipped 56 bytes (+24 bytes)
-  - `__TEXT,__cstring`: built 1023 bytes, shipped 835 bytes (+188 bytes)
+  - `__TEXT,__cstring`: built 1100 bytes, shipped 835 bytes (+265 bytes)
   - `__TEXT_EXEC,__auth_stubs`: built 432 bytes, shipped 400 bytes (+32 bytes)
-  - `__TEXT_EXEC,__text`: built 6784 bytes, shipped 6764 bytes (+20 bytes)
+  - `__TEXT_EXEC,__text`: built 6892 bytes, shipped 6764 bytes (+128 bytes)
 
 ## Defined symbols
 
@@ -116,10 +116,11 @@ xcodebuild -project usbgadget.xcodeproj -configuration Debug -sdk macosx \
 
 ## Strings (-n 8)
 
-- Unique strings (-a -n 8, minimum length 8): built has 20, shipped has 18.
-- Added in built (3):
+- Unique strings (-a -n 8, minimum length 8): built has 21, shipped has 18.
+- Added in built (4):
   - `usbgadget: Controller setProperties failed in 'gay_bowser_usbgadget:doUpdate()' (0x%x).`
   - `usbgadget: Executing 'gay_bowser_usbgadget_userclient::clientClose()'.`
+  - `usbgadget: Failed to allocate config lock in 'gay_bowser_usbgadget:init()'.`
   - `usbgadget: Failed to allocate lock in 'gay_bowser_usbgadget:init()'.`
 - Removed in built (1):
   - `usbgadget: setProperties(%s) not handled`
@@ -135,19 +136,20 @@ These artifacts were built with different Xcode/SDK versions; byte-identical rep
   kernel symbol table. The three removed imports were the dead user-client
   `setProperties` symbol and the base `IOUserClient::clientClose`/`free` stubs;
   the hardened code implements both explicitly.
-- `__TEXT_EXEC,__text` is 6784 bytes against the shipped 6764 (+20) and the S0
-  Release build's 5220. The hardening adds roughly 1.5 KiB; the shipped binary
-  remains a Debug build (see below), so the 20-byte difference is toolchain and
-  configuration noise, not a behavioral delta.
+- `__TEXT_EXEC,__text` is 6892 bytes against the shipped 6764 (+128) and the S0
+  Release build's 5220. The hardening adds roughly 1.6 KiB; the explicit
+  publication lock and its allocation-failure log are part of that delta. The
+  shipped binary remains a Debug build (see below), so size alone is not
+  behavioral equivalence.
 - Defined symbols add the new `stopThread`, `copyProvider`, `releaseProvider`,
   `clientClose`, `free` and the two-argument `thread_bootstrap`; the removed
   `gay_bowser_usbgadget::setConfigurationDict` is the helper replaced by the
   validate/copy/publish sequence. The removed `OSMetaClass::operator delete` and
   `___cxx_global_var_init` are Debug-codegen artifacts present in the shipped
   binary.
-- Strings gain three new log lines (controller `setProperties` failure,
-  `clientClose`, lock-allocation failure) and lose the old unknown-key log; no
-  protocol string changed.
+- Strings gain four new log lines (controller `setProperties` failure,
+  `clientClose`, config-lock allocation failure, lock-allocation failure) and
+  lose the old unknown-key log; no protocol string changed.
 - `Info.plist` is unchanged from S0: toolchain fields plus
   `LSMinimumSystemVersion` 12.0 (the original 10.11 target is rejected by
   Xcode 27).

@@ -51,6 +51,7 @@ private:
      */
     IOService *m_controller_provider;
     IOLock *m_pokeLock;
+    IOLock *m_configLock; // serializes registry publication and private commit
     bool m_needsUpdate;
     unsigned long m_updateSerial;
     bool m_exitThreads;
