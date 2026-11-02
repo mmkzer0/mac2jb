@@ -1,7 +1,9 @@
 # S2 preflight (no SIP change)
 
-Status: executed on 2026-11-02. Blocked before the policy gate by the missing
-matching KDK. No SIP change, install, unload or kext load was performed.
+Status: executed on 2026-11-02. The preflight passes after installing
+`KDK_27.0_26A428.kdk`; the private LocalPolicy is not captured and the S2 policy
+gate has not been applied. No SIP change, install, unload or kext load was
+performed.
 
 This is the pre-load check for the S2 policy gate. It does not replace the
 mock-IOKit harness or the S3 hardware gate.
@@ -22,7 +24,7 @@ The script:
 - builds the kext twice from a clean build tree and compares the executable
   hashes;
 - checks the two-file bundle, `Info.plist`, arm64e, signing state and
-  `kmutil print-diagnostics -z` dependency resolution;
+  `kmutil print-diagnostics -z --kdk <matching-kdk>` dependency resolution;
 - records the public `csrutil status` line and verifies `usbgadget` is not
   loaded and `/Library/Extensions/usbgadget.kext` is absent;
 - optionally captures `sudo bputil -d -j` to a private path outside the
@@ -38,12 +40,12 @@ rejects `-n`. Use `kmutil print-diagnostics`.
 |---|---|
 | Host | macOS 27.0 (26A428), arm64 |
 | Xcode / SDK | Xcode 27.2 / macOS SDK 27.2 |
-| Matching KDK | **missing**: installed `KDK_26.0_25A5279m.kdk`; expected `KDK_27.0_26A428.kdk` |
+| Matching KDK | pass: `KDK_27.0_26A428.kdk` present (26.0 also installed) |
 | S1 source gate | pass |
 | S1 harness | pass (22 tests, ASan+UBSan and TSan) |
 | Reproducible build | pass: two clean builds, 114360 bytes, SHA-256 `644fda29022f7152ab11c029b4bf342160180af364ce8748ad965a0bd0626fd0` |
 | Bundle | pass: two files, no symlinks, `Info.plist` lint, arm64e, unsigned as built |
-| Load diagnostics | dependencies OK; user-owned and unsigned diagnostics are expected pre-install |
+| Load diagnostics | dependencies OK with the matching KDK; user-owned and unsigned diagnostics are expected pre-install |
 | Current state | `usbgadget` not loaded; target install path absent; `Kext Signing: enabled` |
 | Private LocalPolicy | not captured; requires explicit `--private-policy-out` and approval |
 | Rollback | documented in `kext-hardening-plan.md`; not executed |
@@ -52,16 +54,17 @@ rejects `-n`. Use `kmutil print-diagnostics`.
 The report is written to `build/kext-s2-preflight/preflight.md`; the build and
 harness logs are next to it. These are local artifacts, not release inputs.
 
-## Blockers and next steps
+## Next steps
 
-1. Install the matching KDK from developer.apple.com. Do not use
-   `--allow-missing-kdk`.
-2. Rerun the preflight; the KDK check must pass and the summary must say
-   `PASS: no preflight blockers`.
-3. Capture the full LocalPolicy privately only after explicit approval; never
-   commit it (it contains ECID, kuid, vuid and policy hashes).
-4. Then run the one recoveryOS S2 policy session from
-   `kext-hardening-plan.md` §7. The preflight itself never changes SIP.
+1. No preflight blockers. Capture the full LocalPolicy privately only after
+   explicit approval; never commit it (it contains ECID, kuid, vuid and policy
+   hashes):
+   `scripts/kext-s2-preflight.sh --private-policy-out "$HOME/private/bputil.json"`.
+2. Then run the one recoveryOS S2 policy session from
+   `kext-hardening-plan.md` §7, with explicit approval. The preflight itself
+   never changes SIP.
+3. Keep the preflight green: rerun it after any source, toolchain or policy
+   change before a load attempt.
 
 ## Early S3 non-root probe
 

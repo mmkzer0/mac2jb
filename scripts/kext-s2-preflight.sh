@@ -169,7 +169,12 @@ if [[ -d "$ARTIFACT" ]]; then
     info "bundle signing state could not be classified"
   fi
 
-  if kmutil print-diagnostics -p "$ARTIFACT" -z >"$OUT/kmutil-diagnostics.txt" 2>&1; then
+  diagnostic_args=(-p "$ARTIFACT" -z)
+  if [[ -d "$expected_kdk" ]]; then
+    diagnostic_args+=(--kdk "$expected_kdk")
+    info "load diagnostics use $(basename "$expected_kdk")"
+  fi
+  if kmutil print-diagnostics "${diagnostic_args[@]}" >"$OUT/kmutil-diagnostics.txt" 2>&1; then
     :
   fi
   if grep -q "Dependencies: OK" "$OUT/kmutil-diagnostics.txt"; then

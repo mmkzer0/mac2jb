@@ -1,8 +1,8 @@
 # Kext audit and hardening (S1, S1.1)
 
 Status: implementation record for S1 and the S1.1 follow-up; the S2 preflight
-is recorded separately and is currently blocked by the missing matching KDK;
-hardware loading remains S3.
+passes with the matching KDK and the private policy is still uncaptured; the
+policy gate has not been applied and hardware loading remains S3.
 Scope: `vendor/macos_usb_gadget_poc/usbgadget/usbgadget/` (service and user
 client), the S1/S1.1 mock harness, and the static gate.
 
@@ -86,9 +86,9 @@ this cannot be completed before the kext is loaded and is not a pre-load gate.
   Current executable SHA-256 `644fda29022f7152ab11c029b4bf342160180af364ce8748ad965a0bd0626fd0`.
 - S2 preflight: `scripts/kext-s2-preflight.sh` builds twice (identical hash),
   checks the matching KDK, bundle/dependency diagnostics, current load and
-  public SIP state, and rollback documentation. The 2026-11-02 run is blocked
-  by the missing matching KDK; no SIP change, install or load was performed.
-  See `docs/kext-s2-preflight.md`.
+  public SIP state, and rollback documentation. The 2026-11-02 run passes with
+  `KDK_27.0_26A428.kdk`; the private LocalPolicy is not captured, and no SIP
+  change, install or load was performed. See `docs/kext-s2-preflight.md`.
 - `nm -u`: no undefined symbol from this kext's own classes. The new kernel
   imports (`IOLockSleep`, `IOLockWakeup`, `IORegistryEntry::setProperties`,
   `OSString::metaClass`, `OSSymbol::metaClass`, `IOService::metaClass`) exist in
