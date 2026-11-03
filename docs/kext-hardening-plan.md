@@ -570,10 +570,11 @@ Evidence: private, `~/private/mac2jb-s3/` (one folder per phase, mode 0700).
 | 5 open-close | 1000 cycles × 3 services, all opens and closes succeed; user clients peak at 6 and return to 0 within 12 ms (F17 fixed on hardware) |
 | 5 poke | 8000 calls × 3 services; two processes × 320,000 calls on one service; 320,000 calls during 5000 open/close cycles; no hang, no error, slowest call 148 ms under contention |
 | Logs | no panic report; no kernel error since the reboot. `kernelmanagerd` logs "invalid codeful kernel extension in the restricted lookup table" for every AuxKC kext (also Apple's); the kext's debug log writes one line per user-client call (about 25,000 lines in these runs) |
+| 5 Unload/reload | 3 cycles `kmutil unload -b` / `load -b` as root, all exit 0: unloaded → identity `not-loaded`, no services; reloaded from the AuxKC without a reboot → UUID match, three new services, no user clients. Kernel log: 12 × `init`/`start`/`stop`/`free` each (every instance created was freed). `kernelmanagerd` logs "UnloadNotification … Invalid request" after each unload (bookkeeping only; the unload succeeded) |
+| 5 Teardown under load | `kmutil unload` while 16 threads poked all three services (exit 0): first service 334,254 successes, then `MACH_SEND_INVALID_DEST` once the service was gone and 2 × `MIG_SERVER_DIED` for calls in flight; the other two services were already gone. No hang (slowest call 140 ms), no panic, all instances freed; reload restored three services |
 
-Still open: unload/reload cycles as root (one with a poke storm, `setProperties`
-during service teardown), unplug during a transfer, the functional test, log
-capture, and the rollback.
+Still open: unplug during a transfer, the functional test, log capture, and
+the rollback.
 
 ## 9. Risks and open questions
 
