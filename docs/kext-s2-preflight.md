@@ -83,7 +83,9 @@ rejects `-n`. Use `kmutil print-diagnostics`.
 
 ## Result
 
-Run of 2026-11-03 on the clean commit `56668dc` (exit 0, no blockers):
+Run of 2026-11-03 on the clean commit `56668dc` (exit 0, no blockers). The S2
+acceptance rerun on `2f1b6db` (after the policy gate, kext source unchanged)
+also exits 0 with no blockers and the same source digest and executable hash.
 
 | Check | Result |
 |---|---|
@@ -110,8 +112,9 @@ inputs.
 
 ## Next steps
 
-1. S2 is accepted with the `sip2` risk acceptance; the S2 negative control is
-   `NOT_EXECUTED` and must not be reproduced by a load attempt.
+1. S2 is accepted (2026-11-03) with the `sip2` risk acceptance; the S2 negative
+   control is `NOT_EXECUTED` and must not be reproduced by a load attempt. S3
+   starts only after its entry gate (`kext-hardening-plan.md` §8).
 2. Keep the preflight green: rerun it before S3 and after any source,
    toolchain or policy change before a load attempt. To refresh the private
    snapshot, use `--private-policy-out` only with explicit approval; never

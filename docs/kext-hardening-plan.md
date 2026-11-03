@@ -142,8 +142,16 @@ Consequences:
 - Both repeated flags (`--without debug --without kext`) and comma lists
   (`--without debug,kext`) are accepted; unknown tokens fail with
   `invalid option %s.`
-- Scope of the evidence: this is the macOS `csrutil`; recoveryOS runs its own
-  copy. The observed post-S2 dump matches the mapping exactly.
+- The same chain is present in the recoveryOS copy that 1TR runs: the paired
+  `arm64eBaseSystem.dmg` (build `26A428`) ships a thin arm64e `csrutil`, SHA-256
+  `b53cb649a1320e1aa0c9ef0aef960e4daf465dd91de58d84cbcac070a6185557`. Its
+  `setKextSigningRequired:` → `setKernelDebuggingRestricted:` →
+  `setCTRREnforcementRequired:` chain, its `sip2` offset (`self+0x11`) and its
+  `init` default (`0x10`) match the universal macOS binary.
+- Scope: this covers `csrutil` and `bputil`. Apple documents the Startup
+  Security Utility kext checkbox as setting `smb2`; it was not disassembled. A
+  program that writes the LocalPolicy through `libbootpolicy` directly is not a
+  supported path and is not considered.
 
 Target state after S2 (selected Permissive variant, corrected 2026-11-03):
 
@@ -407,8 +415,9 @@ the two post-S2 snapshots are byte-identical.
 `csrutil --without kext` (§2): it stores `0x1` and `0x8` and sets `sip2`. `0x10`
 is the `csrutil` default and is masked at boot. `sip2=true` means iBoot no
 longer locks CTRR, so kernel text stays writable for any code that already has a
-kernel write primitive. It does not let user space write kernel memory. It
-cannot be avoided for an unsigned kext with Apple's tools.
+kernel write primitive. It does not let user space write kernel memory. With
+`csrutil`/`bputil` it cannot be avoided for an unsigned kext; a kext with a
+kext-enabled Developer ID signature would not need `0x1` and keeps CTRR.
 
 S2 is **accepted** on 2026-11-03 with this risk acceptance:
 
@@ -421,10 +430,29 @@ S2 is **accepted** on 2026-11-03 with this risk acceptance:
 
 Negative control: `NOT_EXECUTED`. No `kmutil load -p` artifact was recorded
 before the gate. It must not be reproduced now, because `smb2:true` plus the
-kext SIP bit could attempt the load. Rerun `scripts/kext-s2-preflight.sh` before
-S3.
+kext SIP bit could attempt the load.
+
+Acceptance record: S2 accepted on 2026-11-03 against the corrected target
+(§2). Evidence: post-S2 private dumps (byte-identical), `csrutil` setter chain
+in both the macOS and the recoveryOS binary, preflight pass on the acceptance
+commit (`kext-s2-preflight.md`). S3 has not started.
 
 ## 8. S3 — hardware validation
+
+Entry gate (all must hold before step 1; record each in the S3 log):
+
+- The preflight passes on the commit that is installed, and the installed
+  executable's SHA-256 equals `build/kext/provenance.json`.
+- A verified backup of the Data volume exists, and the restore was checked.
+- 1TR access works (used for S2 on 2026-11-03), and the pre-S2 private
+  LocalPolicy snapshot is available for the rollback comparison.
+- The host runs no untrusted kernel-facing workload during the window; the
+  window ends with the rollback below, not with the functional test.
+
+Abort: a kernel panic, a failed AuxKC rebuild or approval, or IOKit behavior
+outside the harness contract (stuck teardown, leaked user clients, refused
+registry writes from the host path) stops S3. Capture logs and the panic
+report, then run the rollback immediately.
 
 Order:
 
