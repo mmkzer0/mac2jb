@@ -31,12 +31,13 @@ Out of scope for this plan:
 Verified on this machine and from Apple primary sources:
 
 - Host: macOS 27.0 (26A428), Xcode 27.2 (27B52), SDK `MacOSX27.2.sdk`.
-- `drivers/usbgadget.kext` is a two-file prebuilt
+- Until 2026-11-03, `drivers/usbgadget.kext` was the upstream two-file prebuilt
   (`Contents/Info.plist`, `Contents/MacOS/usbgadget`), arm64e, 114008 bytes,
   **not signed at all** (`codesign -dv`: "code object is not signed at all").
-- No build script exists in the repository; CI does not build the kext.
-- `drivers/SHA256SUMS` and `scripts/audit-release.py` pin the shipped binary hash
-  (`a32119c7…` for `Contents/MacOS/usbgadget`).
+  Since then it is the pinned hardened build (§8).
+- No build script existed in the repository; CI does not build the kext.
+- `drivers/SHA256SUMS` and `scripts/audit-release.py` pinned the upstream binary
+  hash (`a32119c7…` for `Contents/MacOS/usbgadget`).
 - The vendored Xcode project builds with the SDK alone; no KDK is needed to build.
   A probe build succeeded in 2.4 s after two overrides:
   `ARCHS=arm64e ONLY_ACTIVE_ARCH=YES MACOSX_DEPLOYMENT_TARGET=12.0`.
@@ -439,38 +440,88 @@ commit (`kext-s2-preflight.md`). S3 has not started.
 
 ## 8. S3 — hardware validation
 
+Only the pinned, self-built hardened kext may be installed or used. Since
+2026-11-03 `drivers/usbgadget.kext` is byte-identical to the Release build of
+the reviewed source, and `drivers/PROVENANCE` pins its digests and LC_UUID
+(`CF8E2A1A-9710-3430-998D-21A0E845D8B2`). Every entry point checks the pins:
+
+| Point | Check |
+|---|---|
+| Repository | `kext-provenance.py verify-bundle` (part of the preflight): the bundle equals a fresh build of the committed source; `PROVENANCE` matches the build record and the Mach-O LC_UUID |
+| Release zip | `audit-release.py`: pinned digests, `PROVENANCE`, LC_UUID parsed from the zipped executable |
+| Install | `scripts/install-driver.sh`: installs only a copy that matches the pins; refuses another kext that declares `gay.bowser.usbgadget`; idempotent; one installer at a time; never deletes (a replaced driver moves to `/Library/Application Support/mac2jb/driver/replaced-*`) |
+| Run time | `install-driver.sh --status`: installed bytes and the loaded UUID must equal the pins; `mac2jb.command` and the GUI start USB input only on `verified` |
+| S3 probe | `kext-s3-probe` refuses every open or write unless the loaded UUID equals the pin |
+
+Boot behavior: the personality matches `IOUSBDeviceController`, so after the
+approval reboot the kext starts automatically, one instance per controller
+(three `AppleT8132USBXDCI` on this Mac), before login. `init`/`start` only
+allocate two locks, start the worker thread, retain the provider and register
+the service; nothing is written to the controller until a host publishes a
+configuration. A defect on that path would panic at every boot, so the boot
+failure recovery below must be known before step 1.
+
 Entry gate (all must hold before step 1; record each in the S3 log):
 
-- The preflight passes on the commit that is installed, and the installed
-  executable's SHA-256 equals `build/kext/provenance.json`.
+- `bash scripts/kext-s2-preflight.sh` passes on the commit that is installed,
+  including the bundled-driver check.
+- `bash scripts/install-driver.sh --verify` passes and `--status` reports
+  `not-installed`; `node --test scripts/test-driver-package.cjs` and
+  `bash scripts/build-kext-s3-probe.sh` pass.
 - A verified backup of the Data volume exists, and the restore was checked.
 - 1TR access works (used for S2 on 2026-11-03), and the pre-S2 private
   LocalPolicy snapshot is available for the rollback comparison.
 - The host runs no untrusted kernel-facing workload during the window; the
   window ends with the rollback below, not with the functional test.
 
-Abort: a kernel panic, a failed AuxKC rebuild or approval, or IOKit behavior
+Abort: a kernel panic, a failed AuxKC rebuild or approval, a status other than
+`verified` after the approval reboot, a probe exit 5, 6 or 7, or IOKit behavior
 outside the harness contract (stuck teardown, leaked user clients, refused
 registry writes from the host path) stops S3. Capture logs and the panic
 report, then run the rollback immediately.
 
 Order:
 
-1. Install the S0/S1-built kext into `/Library/Extensions` with the hardened
-   installer (SIP untouched by the script).
-2. Approve it in System Settings → Privacy & Security; wait for the AuxKC rebuild;
-   reboot.
-3. `kmutil showloaded --list-only | grep usbgadget` and `kmutil showloaded --show-kernel`.
-4. Early S3 non-root boundary probe: from an unprivileged account, write a
-   valid `PublishConfiguration` and `Poke` through the host's
-   `IORegistryEntrySetCFProperties` path, record whether it is accepted, attempt
-   an unknown key and record the rejection. This runs only after the kext is
-   loaded and is not a pre-load gate.
-5. Boundary tests: repeated load/unload cycles, poke storm from a second
-   process, `setProperties` during teardown, unplug during active transfers.
+1. Install: `./mac2jb.command --install-driver` (or the GUI). Keep the output;
+   it names the UUID and where a replaced driver was moved, if any.
+2. Approve it in System Settings → Privacy & Security; wait for the AuxKC
+   rebuild; reboot.
+3. Identity: `./mac2jb.command --driver-status` must print
+   `MAC2JB_DRIVER_STATUS=verified` (exit 0); `kext-s3-probe identity` exits 0
+   and `inventory` lists three services with no user clients.
+4. Early non-root boundary probe: `kext-s3-probe reject` from the login user;
+   every invalid input must be refused. The valid `PublishConfiguration` and
+   `Poke` path is exercised by the unprivileged host in step 6.
+5. Boundary tests, as in `kext-s3-probe.md` (login user, mac2jb host stopped):
+   1000 `open-close` cycles return to the user-client baseline (F17 on
+   hardware); `poke` 1000 × 8 threads without a hang; a cross-process poke
+   storm; a poke storm during user-client churn. Then, as root, repeated
+   `kmutil unload -b gay.bowser.usbgadget` and `kmutil load -b
+   gay.bowser.usbgadget` with `inventory` in between, once while a poke storm
+   runs (`setProperties` during service teardown); record whether reloading
+   from the AuxKC works without a reboot. Finally, unplug during an active
+   transfer.
 6. Functional test: mac2jb typing flow against the Switch with the kurumuz host,
    up to 4/4 verification.
-7. Capture `log show` for the kext subsystem and any panic report.
+7. Capture `log show` for the kext subsystem and any panic report
+   (`/Library/Logs/DiagnosticReports/*.panic`).
+
+Boot failure (panic on every boot):
+
+1. Safe mode skips the AuxKC. Apple documents this for Apple silicon: start
+   into the startup options (hold the power button), hold Shift and choose
+   Continue in Safe Mode; BootPicker sets an `nvram` variable so iBoot does not
+   load the AuxKC on that boot
+   ([Boot modes](https://support.apple.com/guide/security/boot-modes-sec10869885b/web)).
+2. In safe mode, move the kext out of the extensions folder (never delete it):
+   `sudo mv /Library/Extensions/usbgadget.kext "/Library/Application
+   Support/mac2jb/driver/removed-$(date -u +%Y%m%dT%H%M%SZ)"`, run
+   `sudo kmutil install --update-all`, and restart normally. This step has not
+   been exercised.
+3. If safe mode is not reachable: in 1TR, Startup Security Utility, clear
+   "Allow user management of kernel extensions" (`smb2`); iBoot then loads no
+   AuxKC. Remove the kext as in step 2 before enabling it again, and compare a
+   fresh `bputil -d -j` with the S2 snapshot afterwards.
 
 Rollback (unload is not removal):
 
@@ -480,11 +531,13 @@ Mac restarts. Rollback therefore needs two separate proofs:
 
 1. Unload: `sudo kmutil unload -p /Library/Extensions/usbgadget.kext`, restart,
    then `kmutil showloaded --list-only | grep usbgadget` must be empty.
-2. Removal: delete `/Library/Extensions/usbgadget.kext`, rebuild the AuxKC with
-   `sudo kmutil install --update-all`, restart, then verify both:
+2. Removal: move `/Library/Extensions/usbgadget.kext` out of the extensions
+   folder as in boot failure step 2 (never delete it), rebuild the AuxKC with
+   `sudo kmutil install --update-all`, restart, then verify all three:
    - `kmutil showloaded --show all --collection aux --list-only | grep usbgadget`
      is empty (neither loaded nor present in the AuxKC),
-   - `kmutil showloaded --show unloaded --list-only | grep usbgadget` is empty.
+   - `kmutil showloaded --show unloaded --list-only | grep usbgadget` is empty,
+   - `scripts/install-driver.sh --status` reports `not-installed`.
 3. SIP: in recoveryOS `csrutil enable --without debug`, then
    `csrutil allow-research-guests enable` if it was previously on. After the
    reboot `sudo bputil -d -j` must show `sip2` absent (CTRR locked again) and
@@ -493,9 +546,12 @@ Mac restarts. Rollback therefore needs two separate proofs:
 
 Acceptance:
 
-- Kext loads from the reviewed build, the typing flow works, no panic.
+- `--status` is `verified` after the approval reboot, and the probe identity
+  matches the pin.
+- Kext loads from the pinned build, the typing flow works, no panic.
 - The early non-root probe results are recorded: accepted host path,
-  rejected unknown key.
+  rejected invalid inputs; the boundary-test probe evidence is kept
+  (`kext-s3-probe.md`, outside git).
 - Every rollback step executed at least once and documented.
 
 ## 9. Risks and open questions

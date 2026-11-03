@@ -6,10 +6,16 @@ Status: build and hardening evidence; the build contract below is enforced by
 Capture: 2026-11-03, host macOS 27.0 (26A428), Xcode 27.2 (27B52), SDK
 `MacOSX27.2.sdk` (26B118).
 
-The shipped `drivers/usbgadget.kext` was built by the upstream maintainer with
-Xcode 2660 / SDK 26.5 in a Debug configuration (evidence below). Our artifacts
-are Release builds from the vendored source with the current toolchain.
-Byte-identical reproduction of the *shipped* binary is **not** claimed; every
+Since 2026-11-03 `drivers/usbgadget.kext` is our Release build itself:
+`kext-provenance.py verify-bundle` checks that it is byte-identical to a fresh
+build of the committed source and that `drivers/PROVENANCE` matches the build
+record and the executable's LC_UUID (`CF8E2A1A-9710-3430-998D-21A0E845D8B2`).
+
+The comparison below documents the binary it replaced: the upstream v0.3.1
+prebuilt (`a32119c7…`, LC_UUID `124391F6-0CFF-32E0-8884-6F6360DF5D1C`), built
+by the upstream maintainer with Xcode 2660 / SDK 26.5 in a Debug configuration
+(evidence below). In the sections below, "shipped" means that upstream binary.
+Byte-identical reproduction of the upstream binary is **not** claimed; every
 observed difference is explained or bounded. Reproduction of *our own* build is
 claimed and tested, within the limits listed at the end.
 

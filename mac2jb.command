@@ -6,6 +6,9 @@ cd "$(dirname "$0")"
 if [[ "${1:-}" == --install-driver ]]; then
   exec /bin/bash scripts/install-driver.sh
 fi
+if [[ "${1:-}" == --driver-status ]]; then
+  exec /bin/bash scripts/install-driver.sh --status
+fi
 
 printf '\033[2J\033[H'
 cat <<'ART'
@@ -29,19 +32,25 @@ cat <<'ART'
                                          ████░              
                                                             
 ART
-printf '\n  1) Full install (bootstrap + post-bootstrap)\n  2) Post-bootstrap only\n  3) Quit\n  4) Install & load bundled USB driver\n\n'
+printf '\n  1) Full install (bootstrap + post-bootstrap)\n  2) Post-bootstrap only\n  3) Quit\n  4) Install & load the pinned USB driver\n  5) Show USB driver status\n\n'
 read -r -p '  Select: ' mode
-case "$mode" in 1|2) ;; 3) exit 0;; 4) exec /bin/bash scripts/install-driver.sh;; *) echo 'Invalid selection.'; exit 2;; esac
+case "$mode" in
+  1|2) ;;
+  3) exit 0;;
+  4) exec /bin/bash scripts/install-driver.sh;;
+  5) exec /bin/bash scripts/install-driver.sh --status;;
+  *) echo 'Invalid selection.'; exit 2;;
+esac
 
-restart_marker=/Library/Extensions/.mac2jb-usbgadget-restart-required
-boot_seconds="$(sysctl -n kern.boottime | awk '{print $4}' | tr -d ',')"
-if [[ -f "$restart_marker" && "$boot_seconds" =~ ^[0-9]+$ ]] &&
-   (( $(stat -f %m "$restart_marker") >= boot_seconds )); then
-  echo 'The bundled driver was installed this boot. Restart this Mac before starting a session.'
-  exit 1
-fi
-if ! kmutil showloaded --list-only 2>/dev/null | grep -q 'gay.bowser.usbgadget'; then
-  echo 'USB driver is not loaded. Choose option 4 to install/load it, then approve and restart.'
+# Only the pinned mac2jb driver may carry USB input. The installer's status check
+# compares the installed bytes and the loaded UUID with drivers/PROVENANCE; a name
+# match in kmutil output is not enough.
+driver_ok=0
+driver_report="$(/bin/bash scripts/install-driver.sh --status 2>&1)" && driver_ok=1
+if (( driver_ok == 0 )) || [[ "${driver_report%%$'\n'*}" != MAC2JB_DRIVER_STATUS=verified ]]; then
+  printf '%s\n' "$driver_report" | tail -n +2
+  echo 'Use option 4 to install the pinned driver, approve it, restart, then check it with option 5.'
+  echo 'No USB input or ns2jb host was started.'
   exit 1
 fi
 

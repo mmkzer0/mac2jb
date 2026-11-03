@@ -62,6 +62,10 @@ The script:
   any mismatch of artifact, source digest or build script, and it prints the
   commit, dirty flag, source digest, executable hash and the recorded
   Xcode/SDK;
+- runs `kext-provenance.py verify-bundle`: the bundled `drivers/usbgadget.kext`
+  must be byte-identical to this build, and `drivers/SHA256SUMS` and
+  `drivers/PROVENANCE` (digests, LC_UUID, source digest, Xcode/SDK build) must
+  match it, so the driver the installer ships is the one just verified;
 - exports the build inputs of the working tree into a fresh git repository at
   another path (`build/kext-s2-preflight/path-check/independent copy/mac2jb
   checkout`, which contains a space), builds there, and requires the same

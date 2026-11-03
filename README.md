@@ -17,9 +17,10 @@ an all-in-one ns2 jailbreaking tool for Mac.
 
 ## set up the usb driver
 
-the bundled driver is unsigned. Mac startup security and sip must permit unsigned
-kernel extensions. if the driver already works with your partial/custom sip
-configuration, keep that setup.
+the bundled driver is built from the hardened kernel-extension source in this
+repository; `drivers/PROVENANCE` pins its digests and uuid. it is unsigned, so
+Mac startup security and sip must permit unsigned kernel extensions. if the
+driver already works with your partial/custom sip configuration, keep that setup.
 
 ### 1. configure macOS recovery
 
@@ -53,9 +54,17 @@ configuration, keep that setup.
 3. click install & load driver… and approve the administrator prompt.
 4. if prompted, open system settings → privacy & security and allow the driver.
 5. accept the restart prompt or choose apple menu → restart.
-6. reopen mac2jb and wait for the driver check. continue when the driver is loaded and no driver-install restart is pending.
+6. reopen mac2jb and wait for the driver check. continue when the driver is verified and no driver-install restart is pending.
 
-refresh driver status to check it; each reinstall creates a new restart requirement.
+the installer only installs the pinned driver. it moves a different
+`usbgadget.kext` out of `/Library/Extensions` instead of deleting it and refuses
+to install while another kext uses the same identifier. the driver check
+compares the installed files and the loaded driver's uuid with the pin; in
+terminal, `./mac2jb.command --driver-status` shows the same result. refresh
+driver status to check it; each reinstall creates a new restart requirement.
+if the Mac cannot finish starting after a driver install, start up in safe mode
+(hold the power button, then hold shift and choose continue in safe mode): it
+does not load third-party kernel extensions, so you can remove the driver.
 disabling sip reduces macOS protection. mac2jb does not change these settings.
 fully re-enabling sip with this unsigned driver has not been verified and may
 stop it working after a kernel-collection rebuild. see

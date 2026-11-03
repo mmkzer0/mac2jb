@@ -210,7 +210,8 @@ struct BundledRuntime {
                          "vendor/IZDOOM/IZDOOM-v0.17.1-source.tar.gz", "vendor/IZDOOM/SHA256SUMS",
                          "packaging/OunceCake-provenance.json", "packaging/OunceCake-SHA256SUMS",
                          "homebrew/manifest.json", "homebrew/fonts/DejaVuSans.ttf", "homebrew/bin/glslangValidator",
-                         "scripts/install-driver.sh", "drivers/SHA256SUMS",
+                         "scripts/install-driver.sh", "drivers/SHA256SUMS", "drivers/PROVENANCE",
+                         "drivers/usbgadget.kext/Contents/Info.plist",
                          "drivers/usbgadget.kext/Contents/MacOS/usbgadget",
                          "vendor/ns2jb/run.cjs", "assets/bootstrap.bas", "source/LICENSE"] {
                 guard manager.fileExists(atPath: root.appendingPathComponent(path).path) else {

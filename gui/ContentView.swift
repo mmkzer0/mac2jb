@@ -1922,7 +1922,7 @@ struct ContentView: View {
                 model.refreshChecks()
                 model.recordDiagnostic("Driver installer:\n" + output)
                 driverMessage = task.terminationStatus == 0
-                    ? "The bundled unsigned driver is installed. Approve it in System Settings → Privacy & Security if requested, then restart before starting mac2jb. Any previous driver was backed up; its path is in session activity.\n\n\(output.prefix(1400))"
+                    ? "The installer only installs the pinned mac2jb driver build; a replaced driver is moved out of /Library/Extensions. Approve the driver in System Settings → Privacy & Security if requested, then restart this Mac before starting mac2jb. The driver status is re-checked afterwards and USB sessions stay locked until it is verified.\n\n\(output.prefix(1400))"
                     : "Driver setup needs attention. Review the installer error below and macOS kernel-extension policy. Compatible custom SIP configurations are accepted; complete any approval/restart prompts.\n\n\(output.prefix(1400))\n\nLog: \(model.diagnosticLogURL?.path ?? "Log unavailable")"
             }
         }

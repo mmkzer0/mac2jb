@@ -7,6 +7,11 @@ Subcommands:
     used, the build script and the matching KDK.
   verify: fails when the artifact, the git-tracked source digest or the build
     script no longer match the record, or when the build inputs are dirty.
+  verify-bundle: fails unless the bundled driver (drivers/usbgadget.kext) is
+    byte-identical to the built artifact and drivers/SHA256SUMS and
+    drivers/PROVENANCE describe it, the record and each other exactly.
+  bundle: writes a verified artifact, SHA256SUMS and PROVENANCE into a
+    destination directory (the bundled driver); refuses unless verify passes.
   kdk-check: validates the contents of the KDK matching a host version/build.
   export-checkout: copies the build inputs of the working tree into a fresh git
     repository at another path (path-independence checks).
@@ -188,6 +193,22 @@ EXPORT_INPUTS = BUILD_INPUTS + ["scripts/kext-provenance.py", ".gitignore"]
 RECORD_FORMAT = "mac2jb-kext-provenance-v2"
 DEFAULT_RECORD = "build/kext/provenance.json"
 DEFAULT_ARTIFACT = "build/kext/usbgadget.kext"
+DEFAULT_BUNDLE_DIR = "drivers"
+BUNDLE_NAME = "usbgadget.kext"
+BUNDLE_FORMAT = "mac2jb-bundled-kext-v1"
+BUNDLE_KEYS = (
+    "format",
+    "bundle_identifier",
+    "executable_sha256",
+    "info_plist_sha256",
+    "lc_uuid",
+    "source_tree_sha256",
+    "source_commit",
+    "xcode_build",
+    "sdk_build",
+)
+BUNDLE_DIRS = ("Contents", "Contents/MacOS")
+BUNDLE_FILES = ("Contents/Info.plist", "Contents/MacOS/usbgadget")
 DEFAULT_KDK_ROOT = "/Library/Developer/KDKs"
 BUILD_SETTING_KEYS = (
     "DEVELOPER_DIR",
@@ -564,31 +585,282 @@ def cmd_record(args: argparse.Namespace) -> None:
         f.write("\n")
 
 
-def cmd_verify(args: argparse.Namespace) -> None:
-    """Fail unless the artifact, source and build script still match the record.
+RECORD_SECTIONS = ("artifact", "build", "git", "host", "kdk", "source", "toolchain")
+RECORD_FIELDS = (
+    ("artifact", "executable", "sha256"),
+    ("artifact", "files"),
+    ("build", "script_sha256"),
+    ("git", "commit"),
+    ("git", "dirty"),
+    ("source", "tree_sha256"),
+    ("toolchain", "xcode_build"),
+    ("toolchain", "sdk", "build"),
+)
 
-    Problem codes (one 'problem: <code>: <detail>' line each):
-      record, record-dirty, dirty, artifact-files, artifact-hash,
-      source-digest, build-script.
+
+def read_record(path: Path) -> tuple[Optional[dict], list[str]]:
+    """Read a v2 record; return (record, problem details).
+
+    The record is only returned when every section and field that the verify
+    and bundle checks rely on is present, so a malformed record cannot be
+    mistaken for a passing check.
+    """
+    try:
+        record = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as err:
+        return None, [f"cannot read {path}: {err}"]
+    if not isinstance(record, dict):
+        return None, [f"{path} does not contain a JSON object"]
+    if record.get("format") != RECORD_FORMAT:
+        return None, [f"unexpected record format {record.get('format')!r}"]
+    problems = []
+    for section in RECORD_SECTIONS:
+        if not isinstance(record.get(section), dict):
+            problems.append(f"record has no {section!r} object")
+    for field_path in RECORD_FIELDS:
+        value = record
+        for key in field_path:
+            if isinstance(value, dict) and key in value:
+                value = value[key]
+            else:
+                problems.append("record has no " + ".".join(field_path))
+                break
+    return (None if problems else record), problems
+
+
+def artifact_differences(record: dict, current_artifact: dict) -> list[tuple[str, str]]:
+    """Return (problem code, detail) pairs for artifact deviations from the record."""
+    recorded = record["artifact"]
+    differences = []
+    if current_artifact["executable"]["sha256"] != recorded["executable"]["sha256"]:
+        differences.append((
+            "artifact-hash",
+            f"executable is {current_artifact['executable']['sha256']}, record has "
+            f"{recorded['executable']['sha256']}",
+        ))
+    now = {f["path"]: f["sha256"] for f in current_artifact["files"]}
+    then = {f["path"]: f["sha256"] for f in recorded["files"]}
+    if now != then:
+        changed = sorted(p for p in set(now) | set(then) if now.get(p) != then.get(p))
+        differences.append((
+            "artifact-files",
+            "bundle files differ from the record: " + ", ".join(changed),
+        ))
+    return differences
+
+
+def macho_uuid(path: Path) -> str:
+    """Return the LC_UUID of a thin 64-bit Mach-O as uppercase 8-4-4-4-12.
+
+    A FAT container or a file without LC_UUID is rejected: the bundled driver
+    is a single arm64e executable and its load-command UUID identifies the
+    loaded kext in kmutil output.
+    """
+    try:
+        data = Path(path).read_bytes()
+    except OSError as err:
+        raise ProvenanceError(f"cannot read {path}: {err}")
+    if len(data) < 32:
+        raise ProvenanceError(f"{path} is too short to be a 64-bit Mach-O")
+    magic = int.from_bytes(data[0:4], "little")
+    if magic in (0xCAFEBABE, 0xBEBAFECA, 0xCAFEBABF, 0xBFBAFECA):
+        raise ProvenanceError(f"{path} is a FAT Mach-O; a thin 64-bit executable is required")
+    if magic != 0xFEEDFACF:
+        raise ProvenanceError(f"{path} is not a thin 64-bit Mach-O")
+    ncmds = int.from_bytes(data[16:20], "little")
+    offset = 32
+    for _ in range(ncmds):
+        if offset + 8 > len(data):
+            raise ProvenanceError(f"{path} has a truncated load command")
+        cmd = int.from_bytes(data[offset:offset + 4], "little")
+        cmdsize = int.from_bytes(data[offset + 4:offset + 8], "little")
+        if cmdsize < 8 or offset + cmdsize > len(data):
+            raise ProvenanceError(f"{path} has an invalid load command size")
+        if cmd == 0x1B:
+            if cmdsize < 24:
+                raise ProvenanceError(f"{path} has a truncated LC_UUID")
+            raw = data[offset + 8:offset + 24]
+            return "-".join((
+                raw[0:4].hex().upper(),
+                raw[4:6].hex().upper(),
+                raw[6:8].hex().upper(),
+                raw[8:10].hex().upper(),
+                raw[10:16].hex().upper(),
+            ))
+        offset += cmdsize
+    raise ProvenanceError(f"{path} has no LC_UUID load command")
+
+
+def bundle_identifier(info_plist_path: Path) -> Optional[str]:
+    """Return CFBundleIdentifier of an Info.plist, or None when unreadable."""
+    try:
+        data = plistlib.loads(Path(info_plist_path).read_bytes())
+    except Exception:
+        return None
+    value = data.get("CFBundleIdentifier") if isinstance(data, dict) else None
+    return value if isinstance(value, str) else None
+
+
+def parse_bundle_provenance(path: Path) -> tuple[list[tuple[str, str]], list[str]]:
+    """Parse a bundled PROVENANCE file; return (entries, structural problems).
+
+    Values are everything after the first '='. The file must be UTF-8 with LF
+    endings and exactly the contract keys, in order, each once.
+    """
+    try:
+        raw = Path(path).read_bytes()
+    except OSError as err:
+        return [], [f"cannot read {path}: {err}"]
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as err:
+        return [], [f"{path} is not UTF-8: {err}"]
+    problems = []
+    if "\r" in text:
+        problems.append(f"{path} uses CRLF line endings instead of LF")
+    if text and not text.endswith("\n"):
+        problems.append(f"{path} does not end with a newline")
+    entries = []
+    seen = set()
+    for number, line in enumerate(text.splitlines(), 1):
+        key, separator, value = line.partition("=")
+        if not separator or not key:
+            problems.append(f"line {number} is not key=value: {line!r}")
+            continue
+        if key in seen:
+            problems.append(f"key {key!r} appears more than once")
+            continue
+        if not value:
+            problems.append(f"key {key!r} has an empty value")
+        seen.add(key)
+        entries.append((key, value))
+    keys = [key for key, _ in entries]
+    if keys != list(BUNDLE_KEYS):
+        problems.append(f"keys are {keys}, expected {list(BUNDLE_KEYS)}")
+    return entries, problems
+
+
+def sums_problems(sums_path: Path, digests: dict[str, str]) -> list[str]:
+    """Return deviations of SHA256SUMS from the two contract lines."""
+    expected = [
+        f"{digests['Contents/Info.plist']}  Contents/Info.plist",
+        f"{digests['Contents/MacOS/usbgadget']}  Contents/MacOS/usbgadget",
+    ]
+    try:
+        text = sums_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as err:
+        return [f"cannot read {sums_path}: {err}"]
+    problems = []
+    if "\r" in text:
+        problems.append(f"{sums_path} uses CRLF line endings instead of LF")
+    lines = text.splitlines()
+    if len(lines) != len(expected):
+        problems.append(f"{sums_path} has {len(lines)} lines, expected {len(expected)}")
+    for number, line in enumerate(expected, 1):
+        actual = lines[number - 1] if number <= len(lines) else "<missing>"
+        if actual != line:
+            problems.append(f"{sums_path} line {number} is {actual!r}, expected {line!r}")
+    if not problems and text != "\n".join(expected) + "\n":
+        problems.append(f"{sums_path} is not exactly the two contract lines")
+    return problems
+
+
+def bundle_layout_problems(bundle_path: Path) -> list[str]:
+    """Return deviations from the frozen two-file, two-directory bundle shape."""
+    if bundle_path.is_symlink() or not bundle_path.is_dir():
+        return [f"{bundle_path} is missing or not a plain directory"]
+    problems = []
+    seen = set()
+
+    def walk(directory: Path, prefix: str) -> None:
+        try:
+            entries = sorted(directory.iterdir(), key=lambda entry: entry.name)
+        except OSError as err:
+            problems.append(f"cannot list {directory}: {err}")
+            return
+        for entry in entries:
+            relative = prefix + entry.name
+            seen.add(relative)
+            if entry.is_symlink():
+                problems.append(f"symlink: {relative}")
+            elif entry.is_dir():
+                if relative not in BUNDLE_DIRS:
+                    problems.append(f"unexpected directory: {relative}")
+                walk(entry, relative + "/")
+            elif not entry.is_file():
+                problems.append(f"not a regular file: {relative}")
+            elif relative not in BUNDLE_FILES:
+                problems.append(f"unexpected file: {relative}")
+
+    walk(bundle_path, "")
+    for relative in BUNDLE_DIRS + BUNDLE_FILES:
+        if relative not in seen:
+            problems.append(f"missing: {relative}")
+    return problems
+
+
+def replaceable_bundle_problems(bundle_path: Path) -> list[str]:
+    """Return entries that make an existing bundle path unsafe to overwrite."""
+    if bundle_path.is_symlink():
+        return [f"{bundle_path} is a symlink"]
+    if not bundle_path.exists():
+        return []
+    if not bundle_path.is_dir():
+        return [f"{bundle_path} exists and is not a directory"]
+    problems = []
+    for root, dirnames, filenames in os.walk(bundle_path):
+        relative_root = Path(root).relative_to(bundle_path).as_posix()
+        prefix = "" if relative_root == "." else relative_root + "/"
+        for name in sorted(dirnames + filenames):
+            entry = Path(root) / name
+            relative = prefix + name
+            if entry.is_symlink():
+                problems.append(f"unexpected symlink: {relative}")
+            elif relative not in (BUNDLE_DIRS if entry.is_dir() else BUNDLE_FILES):
+                problems.append(f"unexpected entry: {relative}")
+            elif not entry.is_dir() and not entry.is_file():
+                problems.append(f"not a regular file: {relative}")
+        dirnames[:] = [name for name in dirnames if not (Path(root) / name).is_symlink()]
+    return problems
+
+
+def destination_problems(dest_dir: Path) -> list[str]:
+    """Return entries under a --dest-dir that make writing the bundle unsafe."""
+    if dest_dir.is_symlink() and not dest_dir.exists():
+        return [f"{dest_dir} is a broken symlink"]
+    if dest_dir.exists() and not dest_dir.is_dir():
+        return [f"{dest_dir} exists and is not a directory"]
+    problems = replaceable_bundle_problems(dest_dir / BUNDLE_NAME)
+    for name in ("SHA256SUMS", "PROVENANCE"):
+        target = dest_dir / name
+        if target.is_symlink():
+            problems.append(f"unexpected symlink: {target}")
+        elif target.exists() and not target.is_file():
+            problems.append(f"not a regular file: {target}")
+    return problems
+
+
+def verify_state(record_path: Path, artifact_path: Path, source_path: Path,
+                 build_script_path: Path, allow_dirty: bool) -> tuple[Optional[dict], str, list[str], list[str]]:
+    """Check artifact, source and build script against the record.
+
+    Returns (record, summary, notes, problems); notes and problems already
+    carry their 'note: ' or 'problem: <code>: ' prefix.
     """
     ensure_tools(["git", "codesign"])
     problems = []
     notes = []
 
     def problem(code: str, detail: str, dirty_class: bool = False) -> None:
-        if dirty_class and args.allow_dirty:
-            notes.append(f"note: {code}: {detail}")
+        line = f"problem: {code}: {detail}"
+        if dirty_class and allow_dirty:
+            notes.append("note: " + line)
         else:
-            problems.append(f"problem: {code}: {detail}")
+            problems.append(line)
 
-    record = None
-    try:
-        record = json.loads(Path(args.record).read_text(encoding="utf-8"))
-        if record.get("format") != RECORD_FORMAT:
-            problem("record", f"unexpected record format {record.get('format')!r}")
-            record = None
-    except (OSError, ValueError) as err:
-        problem("record", f"cannot read {args.record}: {err}")
+    record, record_problems = read_record(record_path)
+    for detail in record_problems:
+        problem("record", detail)
 
     commit = dirty = source_sha = exec_sha = "unknown"
     try:
@@ -603,17 +875,17 @@ def cmd_verify(args: argparse.Namespace) -> None:
 
     current_source = None
     try:
-        current_source = collect_source_info(Path(args.source), REPO_ROOT)
+        current_source = collect_source_info(source_path, REPO_ROOT)
         source_sha = current_source["tree_sha256"]
     except ProvenanceError as err:
         problem("source-digest", str(err))
 
     current_artifact = None
     try:
-        current_artifact = collect_artifact_info(Path(args.artifact), REPO_ROOT)
+        current_artifact = collect_artifact_info(artifact_path, REPO_ROOT)
         exec_sha = current_artifact["executable"]["sha256"]
     except (ProvenanceError, SystemExit):
-        problem("artifact-files", f"cannot read the artifact bundle: {args.artifact}")
+        problem("artifact-files", f"cannot read the artifact bundle: {artifact_path}")
 
     if record is not None:
         if record["git"]["dirty"]:
@@ -624,25 +896,209 @@ def cmd_verify(args: argparse.Namespace) -> None:
             problem("source-digest",
                     f"source tree is {current_source['tree_sha256']}, record has "
                     f"{record['source']['tree_sha256']}")
-        script = Path(args.build_script)
-        if not script.is_file() or sha256_file(script) != record["build"]["script_sha256"]:
+        if not build_script_path.is_file() or sha256_file(build_script_path) != record["build"]["script_sha256"]:
             problem("build-script", f"{BUILD_SCRIPT_REL} differs from the script that built the artifact")
         if current_artifact is not None:
-            if current_artifact["executable"]["sha256"] != record["artifact"]["executable"]["sha256"]:
-                problem("artifact-hash",
-                        f"executable is {current_artifact['executable']['sha256']}, record has "
-                        f"{record['artifact']['executable']['sha256']}")
-            now = {f["path"]: f["sha256"] for f in current_artifact["files"]}
-            then = {f["path"]: f["sha256"] for f in record["artifact"]["files"]}
-            if now != then:
-                changed = sorted(p for p in set(now) | set(then) if now.get(p) != then.get(p))
-                problem("artifact-files", "bundle files differ from the record: " + ", ".join(changed))
+            for code, detail in artifact_differences(record, current_artifact):
+                problem(code, detail)
 
-    print(f"provenance: commit={commit} dirty={dirty} source_sha256={source_sha} "
-          f"executable_sha256={exec_sha}")
+    summary = (f"provenance: commit={commit} dirty={dirty} source_sha256={source_sha} "
+               f"executable_sha256={exec_sha}")
+    return record, summary, notes, problems
+
+
+def cmd_verify(args: argparse.Namespace) -> None:
+    """Fail unless the artifact, source and build script still match the record.
+
+    Problem codes (one 'problem: <code>: <detail>' line each):
+      record, record-dirty, dirty, artifact-files, artifact-hash,
+      source-digest, build-script.
+    """
+    _record, summary, notes, problems = verify_state(
+        Path(args.record), Path(args.artifact), Path(args.source),
+        Path(args.build_script), args.allow_dirty)
+    print(summary)
     for line in notes + problems:
         print(line)
     sys.exit(1 if problems else 0)
+
+
+def cmd_verify_bundle(args: argparse.Namespace) -> None:
+    """Fail unless the bundled driver and its metadata match this build exactly.
+
+    Problem codes (one 'problem: <code>: <detail>' line each):
+      record, artifact, bundle-files, bundle-bytes, sums, provenance.
+    """
+    ensure_tools(["codesign"])
+    record_path = Path(args.record)
+    artifact_path = Path(args.artifact)
+    bundle_dir = Path(args.bundle_dir)
+    bundle_path = bundle_dir / BUNDLE_NAME
+    problems = []
+
+    def problem(code: str, detail: str) -> None:
+        problems.append(f"problem: {code}: {detail}")
+
+    record, record_problems = read_record(record_path)
+    for detail in record_problems:
+        problem("record", detail)
+    if record is not None and record["git"]["dirty"]:
+        problem("record", "the artifact was built from a dirty tree: "
+                + ", ".join(record["git"].get("dirty_paths", [])))
+
+    current_artifact = None
+    try:
+        current_artifact = collect_artifact_info(artifact_path, REPO_ROOT)
+    except (ProvenanceError, SystemExit, OSError):
+        problem("artifact", f"cannot read the artifact bundle: {artifact_path}")
+    if record is not None and current_artifact is not None:
+        for _code, detail in artifact_differences(record, current_artifact):
+            problem("artifact", detail)
+
+    for detail in bundle_layout_problems(bundle_path):
+        problem("bundle-files", detail)
+
+    bundle_digests = {}
+    for relative in BUNDLE_FILES:
+        candidate = bundle_path / relative
+        if candidate.is_file() and not candidate.is_symlink():
+            try:
+                bundle_digests[relative] = sha256_file(candidate)
+            except OSError:
+                continue
+
+    for relative in BUNDLE_FILES:
+        artifact_file = artifact_path / relative
+        bundle_file = bundle_path / relative
+        if not artifact_file.is_file():
+            problem("bundle-bytes", f"artifact has no {relative}")
+        elif not bundle_file.is_file() or bundle_file.is_symlink():
+            problem("bundle-bytes", f"bundled copy has no regular file {relative}")
+        else:
+            try:
+                identical = artifact_file.read_bytes() == bundle_file.read_bytes()
+            except OSError as err:
+                problem("bundle-bytes", f"cannot read {relative}: {err}")
+                continue
+            if not identical:
+                problem("bundle-bytes", f"{relative} differs from the artifact")
+
+    if len(bundle_digests) == len(BUNDLE_FILES):
+        for detail in sums_problems(bundle_dir / "SHA256SUMS", bundle_digests):
+            problem("sums", detail)
+    else:
+        problem("sums", "cannot hash every bundled file")
+
+    expected_uuid = None
+    executable = bundle_path / BUNDLE_FILES[1]
+    try:
+        expected_uuid = macho_uuid(executable)
+    except ProvenanceError as err:
+        problem("provenance", str(err))
+
+    entries, provenance_problems = parse_bundle_provenance(bundle_dir / "PROVENANCE")
+    for detail in provenance_problems:
+        problem("provenance", detail)
+    if not provenance_problems:
+        values = dict(entries)
+        identifier = bundle_identifier(bundle_path / BUNDLE_FILES[0])
+        if identifier is None:
+            problem("provenance", f"cannot read CFBundleIdentifier from {BUNDLE_FILES[0]}")
+        elif values["bundle_identifier"] != identifier:
+            problem("provenance", f"bundle_identifier={values['bundle_identifier']} "
+                    f"does not match Info.plist CFBundleIdentifier={identifier}")
+        if values["format"] != BUNDLE_FORMAT:
+            problem("provenance", f"format={values['format']} is not {BUNDLE_FORMAT}")
+        for key, relative in (("info_plist_sha256", "Contents/Info.plist"),
+                              ("executable_sha256", "Contents/MacOS/usbgadget")):
+            actual = bundle_digests.get(relative)
+            if actual is not None and values[key] != actual:
+                problem("provenance", f"{key}={values[key]} does not match {relative} ({actual})")
+        if not re.fullmatch(r"[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}",
+                            values["lc_uuid"]):
+            problem("provenance", f"lc_uuid={values['lc_uuid']} is not uppercase 8-4-4-4-12")
+        if expected_uuid is not None and values["lc_uuid"] != expected_uuid:
+            problem("provenance", f"lc_uuid={values['lc_uuid']} does not match "
+                    f"the executable's LC_UUID {expected_uuid}")
+        if record is not None:
+            if values["source_tree_sha256"] != record["source"]["tree_sha256"]:
+                problem("provenance", f"source_tree_sha256={values['source_tree_sha256']} "
+                        f"does not match the record's {record['source']['tree_sha256']}")
+            if values["xcode_build"] != record["toolchain"]["xcode_build"]:
+                problem("provenance", f"xcode_build={values['xcode_build']} "
+                        f"does not match the record's {record['toolchain']['xcode_build']}")
+            if values["sdk_build"] != record["toolchain"]["sdk"]["build"]:
+                problem("provenance", f"sdk_build={values['sdk_build']} "
+                        f"does not match the record's {record['toolchain']['sdk']['build']}")
+        if not re.fullmatch(r"[0-9a-f]{40}", values["source_commit"]):
+            problem("provenance", f"source_commit={values['source_commit']} is not 40 lowercase hex characters")
+
+    source_tree = record["source"]["tree_sha256"] if record is not None else "unknown"
+    print(f"bundle: executable_sha256={bundle_digests.get('Contents/MacOS/usbgadget', 'unknown')} "
+          f"lc_uuid={expected_uuid or 'unknown'} source_tree_sha256={source_tree}")
+    for line in problems:
+        print(line)
+    sys.exit(1 if problems else 0)
+
+
+def cmd_bundle(args: argparse.Namespace) -> None:
+    """Write a verified artifact as a bundled driver with its metadata.
+
+    Refuses unless record, source, build script and artifact pass the same
+    checks as `verify`. Nothing is removed: a destination bundle holding
+    entries outside the frozen two-file layout is rejected.
+    """
+    record_path = Path(args.record)
+    artifact_path = Path(args.artifact)
+    dest_dir = Path(args.dest_dir)
+
+    record, _summary, _notes, problems = verify_state(
+        record_path, artifact_path, Path(args.source), Path(args.build_script),
+        allow_dirty=False)
+    if problems:
+        for line in problems:
+            print(line)
+        sys.exit(1)
+
+    unexpected = destination_problems(dest_dir)
+    if unexpected:
+        for detail in unexpected:
+            print(f"problem: bundle-files: {detail}")
+        sys.exit(1)
+
+    artifact_plist = artifact_path / BUNDLE_FILES[0]
+    artifact_executable = artifact_path / BUNDLE_FILES[1]
+    identifier = bundle_identifier(artifact_plist)
+    if identifier is None:
+        raise ProvenanceError(f"cannot read CFBundleIdentifier from {artifact_plist}")
+    lc_uuid = macho_uuid(artifact_executable)
+
+    bundle_path = dest_dir / BUNDLE_NAME
+    (bundle_path / "Contents" / "MacOS").mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(artifact_plist, bundle_path / "Contents" / "Info.plist")
+    shutil.copyfile(artifact_executable, bundle_path / "Contents" / "MacOS" / "usbgadget")
+
+    digests = {relative: sha256_file(bundle_path / relative) for relative in BUNDLE_FILES}
+    sums_text = (
+        f"{digests['Contents/Info.plist']}  Contents/Info.plist\n"
+        f"{digests['Contents/MacOS/usbgadget']}  Contents/MacOS/usbgadget\n"
+    )
+    (dest_dir / "SHA256SUMS").write_bytes(sums_text.encode("utf-8"))
+
+    entries = (
+        ("format", BUNDLE_FORMAT),
+        ("bundle_identifier", identifier),
+        ("executable_sha256", digests["Contents/MacOS/usbgadget"]),
+        ("info_plist_sha256", digests["Contents/Info.plist"]),
+        ("lc_uuid", lc_uuid),
+        ("source_tree_sha256", record["source"]["tree_sha256"]),
+        ("source_commit", record["git"]["commit"]),
+        ("xcode_build", record["toolchain"]["xcode_build"]),
+        ("sdk_build", record["toolchain"]["sdk"]["build"]),
+    )
+    (dest_dir / "PROVENANCE").write_bytes(
+        "".join(f"{key}={value}\n" for key, value in entries).encode("utf-8"))
+    print(f"bundle: {to_repo_rel(dest_dir, REPO_ROOT)}")
 
 
 def cmd_kdk_check(args: argparse.Namespace) -> None:
@@ -1110,6 +1566,24 @@ def main() -> None:
         help="Report a dirty tree as a note instead of a failure (iteration builds)",
     )
 
+    verify_bundle_parser = subparsers.add_parser(
+        "verify-bundle",
+        help="Fail unless drivers/ is byte-identical to this build with matching metadata",
+    )
+    verify_bundle_parser.add_argument("--record", default=str(REPO_ROOT / DEFAULT_RECORD))
+    verify_bundle_parser.add_argument("--artifact", default=str(REPO_ROOT / DEFAULT_ARTIFACT))
+    verify_bundle_parser.add_argument("--bundle-dir", default=str(REPO_ROOT / DEFAULT_BUNDLE_DIR))
+
+    bundle_parser = subparsers.add_parser(
+        "bundle",
+        help="Write usbgadget.kext, SHA256SUMS and PROVENANCE from a verified build",
+    )
+    bundle_parser.add_argument("--dest-dir", required=True)
+    bundle_parser.add_argument("--record", default=str(REPO_ROOT / DEFAULT_RECORD))
+    bundle_parser.add_argument("--artifact", default=str(REPO_ROOT / DEFAULT_ARTIFACT))
+    bundle_parser.add_argument("--source", default=str(REPO_ROOT / SOURCE_REL))
+    bundle_parser.add_argument("--build-script", default=str(REPO_ROOT / BUILD_SCRIPT_REL))
+
     kdk_parser = subparsers.add_parser(
         "kdk-check",
         help="Validate the KDK matching the host (or given) macOS version/build",
@@ -1148,6 +1622,8 @@ def main() -> None:
     handlers = {
         "record": cmd_record,
         "verify": cmd_verify,
+        "verify-bundle": cmd_verify_bundle,
+        "bundle": cmd_bundle,
         "kdk-check": cmd_kdk_check,
         "export-checkout": cmd_export_checkout,
         "report": cmd_report,

@@ -6,6 +6,48 @@ import sys
 import zipfile
 from pathlib import PurePosixPath
 
+DRIVER_FORMAT = 'mac2jb-bundled-kext-v1'
+DRIVER_BUNDLE_ID = 'gay.bowser.usbgadget'
+DRIVER_LC_UUID = 'CF8E2A1A-9710-3430-998D-21A0E845D8B2'
+DRIVER_PROVENANCE_KEYS = (
+    'format', 'bundle_identifier', 'executable_sha256', 'info_plist_sha256',
+    'lc_uuid', 'source_tree_sha256', 'source_commit', 'xcode_build', 'sdk_build',
+)
+
+
+def macho_lc_uuid(data):
+    """Return the LC_UUID of thin 64-bit Mach-O bytes as uppercase 8-4-4-4-12."""
+    if len(data) < 32:
+        raise ValueError('truncated Mach-O header')
+    magic = int.from_bytes(data[0:4], 'little')
+    if magic in (0xCAFEBABE, 0xBEBAFECA, 0xCAFEBABF, 0xBFBAFECA):
+        raise ValueError('FAT Mach-O')
+    if magic != 0xFEEDFACF:
+        raise ValueError('not a thin 64-bit Mach-O')
+    ncmds = int.from_bytes(data[16:20], 'little')
+    offset = 32
+    for _ in range(ncmds):
+        if offset + 8 > len(data):
+            raise ValueError('truncated load command')
+        cmd = int.from_bytes(data[offset:offset + 4], 'little')
+        cmdsize = int.from_bytes(data[offset + 4:offset + 8], 'little')
+        if cmdsize < 8 or offset + cmdsize > len(data):
+            raise ValueError('invalid load command size')
+        if cmd == 0x1B:
+            raw = data[offset + 8:offset + 24]
+            if len(raw) != 16:
+                raise ValueError('truncated LC_UUID')
+            return '-'.join((
+                raw[0:4].hex().upper(),
+                raw[4:6].hex().upper(),
+                raw[6:8].hex().upper(),
+                raw[8:10].hex().upper(),
+                raw[10:16].hex().upper(),
+            ))
+        offset += cmdsize
+    raise ValueError('missing LC_UUID')
+
+
 if len(sys.argv) != 2:
     raise SystemExit('usage: python3 scripts/audit-release.py mac2jb-complete.zip')
 
@@ -200,6 +242,7 @@ required = {
     'mac2jb/drivers/LICENSE',
     'mac2jb/drivers/LICENSE-APSL-2.0.txt',
     'mac2jb/drivers/SHA256SUMS',
+    'mac2jb/drivers/PROVENANCE',
     'mac2jb/scripts/install-driver.sh',
     'mac2jb/scripts/package-gui-payload.py',
     'mac2jb/assets/bootstrap.bas',
@@ -283,17 +326,48 @@ with zipfile.ZipFile(archive) as z:
     except (KeyError, ValueError, TypeError, UnicodeError):
         violations.append('missing or malformed browser research provenance')
     driver_files = {
-        'Contents/Info.plist': 'c38786b3eb1b51055505bca54c88df77b797e1785c146ec1d54ee3273a934faf',
-        'Contents/MacOS/usbgadget': 'a32119c7908098c49c2540a17aad4d172378de969885ad4f4a752bdb8ef91308',
+        'Contents/Info.plist': 'a4ca368ce107273aaf008a8dd68d1de898eb9889c5efc6e56ea76601912ce0bd',
+        'Contents/MacOS/usbgadget': 'de79702967e272694568d6545f4e131bfcf0b21509c1cc3aab8c4c4c572674c5',
     }
     prefix = 'mac2jb/drivers/usbgadget.kext/'
+    driver_data = {}
     for suffix, expected in driver_files.items():
         name = prefix + suffix
-        if name not in names or hashlib.sha256(z.read(name)).hexdigest() != expected:
+        if name not in names:
+            violations.append('missing or changed approved unsigned driver: ' + name)
+            continue
+        data = z.read(name)
+        driver_data[suffix] = data
+        if hashlib.sha256(data).hexdigest() != expected:
             violations.append('missing or changed approved unsigned driver: ' + name)
     for name in names:
         if name.startswith(prefix) and not name.endswith('/') and name[len(prefix):] not in driver_files:
             violations.append('unexpected driver file or signing metadata: ' + name)
+    try:
+        entries = []
+        for line in z.read('mac2jb/drivers/PROVENANCE').decode('utf-8').splitlines():
+            key, separator, value = line.partition('=')
+            if not separator or not key or any(key == existing for existing, _ in entries):
+                raise ValueError('invalid driver provenance entry')
+            entries.append((key, value))
+        values = dict(entries)
+        if [key for key, _ in entries] != list(DRIVER_PROVENANCE_KEYS):
+            raise ValueError('changed driver provenance keys')
+        if (values['format'] != DRIVER_FORMAT
+                or values.get('bundle_identifier') != DRIVER_BUNDLE_ID
+                or values.get('executable_sha256') != driver_files['Contents/MacOS/usbgadget']
+                or values.get('info_plist_sha256') != driver_files['Contents/Info.plist']
+                or values.get('lc_uuid') != DRIVER_LC_UUID):
+            violations.append('changed driver provenance')
+    except (KeyError, ValueError, UnicodeError):
+        violations.append('missing or malformed driver PROVENANCE')
+    try:
+        executable_uuid = macho_lc_uuid(driver_data['Contents/MacOS/usbgadget'])
+    except (KeyError, ValueError):
+        violations.append('driver executable is missing or has no thin 64-bit LC_UUID')
+    else:
+        if executable_uuid != DRIVER_LC_UUID:
+            violations.append('driver executable LC_UUID does not match the pinned UUID')
     host_profiles = 'mac2jb/packaging/host-profiles.json'
     if host_profiles in names:
         try:

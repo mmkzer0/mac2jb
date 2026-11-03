@@ -176,5 +176,8 @@ Frama-C/TrustInSoft/seL4, and KASAN for third-party kexts.
   mapped until reboot, so returning into unloaded text is not reachable.
 - Kernel ABI, PAC signing, AuxKC policy and hardware timing are outside static
   verification; S3 is the gate.
-- The shipped binary corresponds to a Debug build of an older toolchain; our
-  Release artifact differs in codegen (see `kext-provenance.md`).
+- Until 2026-11-03 the bundled binary was an upstream Debug build of the
+  unhardened source (see `kext-provenance.md`). `drivers/usbgadget.kext` is
+  now the hardened Release build, byte-identical and pinned by
+  `drivers/PROVENANCE`; the installer, the status check and the release audit
+  enforce the pin.

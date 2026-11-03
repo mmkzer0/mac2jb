@@ -133,6 +133,106 @@ private struct GUIEvent: Decodable {
     let truncated: Bool?
 }
 
+// BEGIN DriverStatusCheck (extracted verbatim by the standalone parser check; keep it free of other dependencies)
+/// Outcome of `scripts/install-driver.sh --status`. `loaded` is the only value that may unlock USB/HID work.
+struct DriverStatusReport: Equatable {
+    let loaded: Bool
+    /// nil when the check could not tell whether a driver is installed.
+    let installed: Bool?
+    let message: String
+}
+
+/// Fail-closed parser for the installer's `--status` contract: line 1 is `MAC2JB_DRIVER_STATUS=<state>`,
+/// line 2 is a human-readable sentence, and every state has one fixed exit code. Only exit 0 together
+/// with the exact `verified` state is accepted as loaded; every other combination, including a known
+/// state with the wrong exit code, garbage, empty output or a launch failure, is not.
+enum DriverStatusCheck {
+    enum State: String, CaseIterable {
+        case verified
+        case restartRequired = "restart-required"
+        case notInstalled = "not-installed"
+        case notLoaded = "not-loaded"
+        case mismatchInstalled = "mismatch-installed"
+        case mismatchLoaded = "mismatch-loaded"
+        case bundleInvalid = "bundle-invalid"
+        case unknown
+
+        var exitCode: Int32 {
+            switch self {
+            case .verified: return 0
+            case .restartRequired: return 10
+            case .notInstalled: return 11
+            case .notLoaded: return 12
+            case .mismatchInstalled: return 13
+            case .mismatchLoaded: return 14
+            case .bundleInvalid: return 15
+            case .unknown: return 16
+            }
+        }
+
+        /// true/false when the state proves the answer, nil when it does not.
+        var installed: Bool? {
+            switch self {
+            case .verified, .restartRequired, .notLoaded, .mismatchInstalled: return true
+            case .notInstalled: return false
+            case .mismatchLoaded, .bundleInvalid, .unknown: return nil
+            }
+        }
+
+        var advice: String {
+            switch self {
+            case .verified:
+                return "The pinned mac2jb USB driver is installed, loaded and verified."
+            case .restartRequired:
+                return "The driver was installed or a load was requested during this boot. Approve it in System Settings → Privacy & Security if asked, then restart this Mac."
+            case .notInstalled:
+                return "The mac2jb USB driver is not installed. Use “Install & load driver…”."
+            case .notLoaded:
+                return "The pinned driver is installed but not loaded. Approve it in System Settings → Privacy & Security and restart this Mac, then refresh."
+            case .mismatchInstalled:
+                return "The installed driver is not the pinned mac2jb build, or another kext declares gay.bowser.usbgadget. Reinstall the bundled driver; the installer moves the other one out of /Library/Extensions. Then restart this Mac."
+            case .mismatchLoaded:
+                return "The loaded gay.bowser.usbgadget driver is not the pinned mac2jb build, or several are loaded. Reinstall the bundled driver and restart this Mac."
+            case .bundleInvalid:
+                return "The driver bundled in this app failed verification, so nothing will be installed or used. Download or rebuild the app."
+            case .unknown:
+                return "Which driver is loaded could not be determined. Refresh the driver status; if this persists, restart this Mac."
+            }
+        }
+    }
+
+    private static let prefix = "MAC2JB_DRIVER_STATUS="
+
+    static func parse(exitCode: Int32, output: String) -> DriverStatusReport {
+        // Split on LF only (a CRLF pair is a single Character in Swift) and ignore surrounding blanks and CR.
+        let trim = CharacterSet.whitespaces.union(CharacterSet(charactersIn: "\r"))
+        let lines = output.unicodeScalars.split(separator: "\n", omittingEmptySubsequences: false).map {
+            String(String.UnicodeScalarView($0)).trimmingCharacters(in: trim)
+        }
+        let first = lines.first ?? ""
+        guard first.hasPrefix(prefix), let state = State(rawValue: String(first.dropFirst(prefix.count))) else {
+            let seen = first.isEmpty ? "no output" : "“\(first.prefix(160))”"
+            return DriverStatusReport(
+                loaded: false, installed: nil,
+                message: "The driver check did not return a recognized result (exit \(exitCode), \(seen)). Refresh the driver status; if this persists, reinstall the driver.")
+        }
+        guard exitCode == state.exitCode else {
+            return DriverStatusReport(
+                loaded: false, installed: nil,
+                message: "The driver check was inconsistent (state \(state.rawValue), exit \(exitCode)), so the driver is treated as not verified. Refresh the driver status; if this persists, reinstall the driver.")
+        }
+        if state == .verified {
+            return DriverStatusReport(loaded: true, installed: true, message: state.advice)
+        }
+        var message = state.advice
+        if lines.count > 1, !lines[1].isEmpty, !lines[1].hasPrefix(prefix) {
+            message += "\n\(lines[1].prefix(300))"
+        }
+        return DriverStatusReport(loaded: false, installed: state.installed, message: message)
+    }
+}
+// END DriverStatusCheck
+
 @MainActor final class SessionModel: ObservableObject {
     @Published var phase: SessionPhase = .preparing
     @Published private(set) var isInitialPreparation = true
@@ -220,6 +320,7 @@ private struct GUIEvent: Decodable {
     @Published var driverInstalled = false
     @Published var driverLoaded = false
     @Published var driverSetupRunning = false
+    private var driverCheckGeneration = 0
     @Published var error: String?
     @Published private(set) var diagnosticLogURL: URL?
     @Published private(set) var postRun = PostRunSessionState()
@@ -576,6 +677,7 @@ private struct GUIEvent: Decodable {
                     try BundledRuntime.prepare(sessionParent: override, host: host)
                 }.value
                 runtime = prepared
+                checkDriver()
                 openSessionLog(in: prepared.root)
                 append("\(host.label) offline runtime prepared. Session files are private to your account.")
                 // Keep a successfully prepared runtime available for retry,
@@ -594,27 +696,29 @@ private struct GUIEvent: Decodable {
 
     func refreshChecks() {
         refreshNetworkAddressesIfIdle()
-        driverInstalled = FileManager.default.fileExists(atPath: "/Library/Extensions/usbgadget.kext")
-        driverStatus = driverInstalled ? "Driver installed; checking loaded status…" : "Driver not found in /Library/Extensions"
+        checkDriver()
+    }
+
+    /// Runs the installer's read-only `--status` (the only source of truth for the pinned-driver
+    /// identity) and unlocks USB/HID work only for a verified result. Fail closed in every other case.
+    private func checkDriver() {
+        driverCheckGeneration &+= 1
+        let generation = driverCheckGeneration
+        driverLoaded = false
+        guard let runtime else {
+            driverInstalled = FileManager.default.fileExists(atPath: "/Library/Extensions/usbgadget.kext")
+            driverStatus = "Preparing the bundled runtime; the driver check runs when it is ready."
+            return
+        }
+        driverStatus = "Checking the USB gadget driver…"
+        let script = runtime.root.appendingPathComponent("scripts/install-driver.sh").path
         Task {
-            let installed = driverInstalled
-            let result = await Task.detached { Self.capture("/usr/bin/kmutil", ["showloaded", "--list-only"]) }.value
-            if result.0 == 0 {
-                driverLoaded = result.1.contains("gay.bowser.usbgadget") || result.1.contains("usbgadget")
-                driverStatus = driverLoaded
-                    ? "USB gadget driver is loaded"
-                    : (installed ? "Driver installed; not reported as loaded" : "USB gadget driver not reported as loaded")
-            } else {
-                driverLoaded = false
-                driverStatus = installed ? "Driver installed; loaded status could not be verified" : "Driver installation and loaded status need checking"
-            }
-            let marker = "/Library/Extensions/.mac2jb-usbgadget-restart-required"
-            if let attributes = try? FileManager.default.attributesOfItem(atPath: marker),
-               let modified = attributes[.modificationDate] as? Date,
-               modified > Date().addingTimeInterval(-ProcessInfo.processInfo.systemUptime) {
-                driverLoaded = false
-                driverStatus = "Driver installed — restart this Mac before starting a session"
-            }
+            let result = await Task.detached { Self.capture("/bin/bash", [script, "--status"], timeout: 60) }.value
+            guard generation == driverCheckGeneration else { return }
+            let report = DriverStatusCheck.parse(exitCode: result.0, output: result.1)
+            driverLoaded = report.loaded
+            driverInstalled = report.installed ?? FileManager.default.fileExists(atPath: "/Library/Extensions/usbgadget.kext")
+            driverStatus = report.message
         }
     }
 
@@ -2559,12 +2663,25 @@ private struct GUIEvent: Decodable {
         NetworkSelection.isIPv4(address)
     }
 
-    nonisolated private static func capture(_ executable: String, _ arguments: [String]) -> (Int32, String) {
+    nonisolated private static func capture(_ executable: String, _ arguments: [String], timeout: TimeInterval? = nil) -> (Int32, String) {
         let process = Process(); let output = Pipe()
         process.executableURL = URL(fileURLWithPath: executable); process.arguments = arguments
         process.standardOutput = output; process.standardError = output; process.standardInput = FileHandle.nullDevice
         do { try process.run() } catch { return (1, error.localizedDescription) }
+        if let timeout {
+            let pid = process.processIdentifier
+            DispatchQueue.global().asyncAfter(deadline: .now() + timeout) {
+                guard process.isRunning else { return }
+                process.terminate()
+                DispatchQueue.global().asyncAfter(deadline: .now() + 2) {
+                    if process.isRunning { kill(pid, SIGKILL) }
+                }
+            }
+        }
         let data = output.fileHandleForReading.readDataToEndOfFile(); process.waitUntilExit()
-        return (process.terminationStatus, String(decoding: data, as: UTF8.self))
+        let text = String(decoding: data, as: UTF8.self)
+        // A signal death (including the timeout above) has no exit code; report it as a failure, never as success.
+        if process.terminationReason == .uncaughtSignal { return (128 + process.terminationStatus, text) }
+        return (process.terminationStatus, text)
     }
 }

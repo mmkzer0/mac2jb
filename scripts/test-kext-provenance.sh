@@ -6,7 +6,10 @@
 # Covered: executable hash independent of the checkout path and the ambient environment; verify
 # rejects a tampered artifact, a post-build source edit (uncommitted and committed) and a dirty tree;
 # ignored files do not change the source digest; `record` refuses a source that differs from the
-# compiled copy; the KDK check rejects empty or mismatching KDK directories; the preflight rejects
+# compiled copy; the KDK check rejects empty or mismatching KDK directories; verify-bundle accepts a
+# bundle written by `bundle` and rejects a flipped executable byte, an extra file, a wrong SHA256SUMS
+# line, reordered or duplicated PROVENANCE keys and a wrong lc_uuid; `bundle` refuses a dirty
+# checkout and its output is byte-identical to the repository's drivers/ files; the preflight rejects
 # private-policy paths that resolve into the repository.
 set -euo pipefail
 PATH=/usr/bin:/bin:/usr/sbin:/sbin
@@ -78,6 +81,8 @@ gitq() {
 }
 build_in() { (cd "$1" && bash scripts/build-kext.sh); }
 verify_in() { (cd "$1" && "$PYTHON" scripts/kext-provenance.py verify "${@:2}"); }
+bundle_in() { (cd "$1" && "$PYTHON" scripts/kext-provenance.py bundle --dest-dir "$2" "${@:3}"); }
+verify_bundle_in() { (cd "$1" && "$PYTHON" scripts/kext-provenance.py verify-bundle "${@:2}"); }
 exec_hash() {
   local out
   out="$(shasum -a 256 "$1/build/kext/usbgadget.kext/Contents/MacOS/usbgadget")"
@@ -125,6 +130,79 @@ if [[ "$(exec_hash "$A")" == "$hash_a" ]]; then
   note_ok "OTHER_CFLAGS/OPTIMIZATION/SDKROOT in the environment do not change the executable"
 else
   note_fail "ambient environment changed the executable hash"
+fi
+
+echo "== bundled driver"
+BUNDLE="$WORK/bundle"
+expect_pass "bundle writes a driver from a clean checkout" bundle_in "$A" "$BUNDLE"
+expect_pass "verify-bundle accepts the written bundle" verify_bundle_in "$A" --bundle-dir "$BUNDLE"
+bundle_line="$(verify_bundle_in "$A" --bundle-dir "$BUNDLE" 2>&1 | grep '^bundle:' || true)"
+bundle_uuid="${bundle_line#*lc_uuid=}"
+bundle_uuid="${bundle_uuid%% *}"
+if [[ "$bundle_line" == "bundle: executable_sha256=$hash_a lc_uuid=$bundle_uuid source_tree_sha256=$digest_a" ]] &&
+   [[ "$bundle_uuid" =~ ^[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}$ ]]; then
+  note_ok "verify-bundle summary names the executable, its LC_UUID and the source digest"
+else
+  note_fail "unexpected verify-bundle summary: $bundle_line"
+fi
+
+expect_pass "bundle into a temporary directory from the repository build" \
+  "$PYTHON" "$TOOL" bundle --dest-dir "$WORK/repo-drivers"
+for relative in usbgadget.kext/Contents/Info.plist usbgadget.kext/Contents/MacOS/usbgadget \
+                SHA256SUMS PROVENANCE; do
+  if cmp -s "$WORK/repo-drivers/$relative" "$ROOT/drivers/$relative"; then
+    note_ok "bundle output is byte-identical to drivers/$relative"
+  else
+    note_fail "bundle output differs from drivers/$relative"
+  fi
+done
+
+cp -R "$BUNDLE" "$WORK/bundle-flip"
+append_byte "$WORK/bundle-flip/usbgadget.kext/Contents/MacOS/usbgadget"
+expect_nonzero "verify-bundle rejects a flipped executable byte" \
+  verify_bundle_in "$A" --bundle-dir "$WORK/bundle-flip"
+expect_code yes bundle-bytes
+
+cp -R "$BUNDLE" "$WORK/bundle-extra"
+printf 'x' >"$WORK/bundle-extra/usbgadget.kext/Contents/extra"
+expect_nonzero "verify-bundle rejects an extra file" \
+  verify_bundle_in "$A" --bundle-dir "$WORK/bundle-extra"
+expect_code yes bundle-files
+
+cp -R "$BUNDLE" "$WORK/bundle-sums"
+{ printf '0000000000000000000000000000000000000000000000000000000000000000  Contents/Info.plist\n'
+  awk 'NR==2' "$WORK/bundle-sums/SHA256SUMS"; } >"$WORK/bundle-sums/SHA256SUMS.new"
+mv "$WORK/bundle-sums/SHA256SUMS.new" "$WORK/bundle-sums/SHA256SUMS"
+expect_nonzero "verify-bundle rejects a wrong SHA256SUMS line" \
+  verify_bundle_in "$A" --bundle-dir "$WORK/bundle-sums"
+expect_code yes sums
+
+cp -R "$BUNDLE" "$WORK/bundle-order"
+awk 'NR==2{line=$0;next} NR==3{print;print line;next} {print}' \
+  "$WORK/bundle-order/PROVENANCE" >"$WORK/bundle-order/PROVENANCE.new"
+mv "$WORK/bundle-order/PROVENANCE.new" "$WORK/bundle-order/PROVENANCE"
+expect_nonzero "verify-bundle rejects reordered PROVENANCE keys" \
+  verify_bundle_in "$A" --bundle-dir "$WORK/bundle-order"
+expect_code yes provenance
+
+cp -R "$BUNDLE" "$WORK/bundle-dup"
+awk '{print} NR==2{print}' "$WORK/bundle-dup/PROVENANCE" >"$WORK/bundle-dup/PROVENANCE.new"
+mv "$WORK/bundle-dup/PROVENANCE.new" "$WORK/bundle-dup/PROVENANCE"
+expect_nonzero "verify-bundle rejects a duplicated PROVENANCE key" \
+  verify_bundle_in "$A" --bundle-dir "$WORK/bundle-dup"
+expect_code yes provenance
+
+cp -R "$BUNDLE" "$WORK/bundle-uuid"
+awk -F= '$1=="lc_uuid"{print "lc_uuid=00000000-0000-0000-0000-000000000000"; next} {print}' \
+  "$WORK/bundle-uuid/PROVENANCE" >"$WORK/bundle-uuid/PROVENANCE.new"
+mv "$WORK/bundle-uuid/PROVENANCE.new" "$WORK/bundle-uuid/PROVENANCE"
+expect_nonzero "verify-bundle rejects a wrong lc_uuid" \
+  verify_bundle_in "$A" --bundle-dir "$WORK/bundle-uuid"
+expect_code yes provenance
+if last_has "lc_uuid"; then
+  note_ok "wrong lc_uuid rejection names lc_uuid"
+else
+  note_fail "wrong lc_uuid rejection does not name lc_uuid"
 fi
 
 echo "== ignored files"
@@ -178,6 +256,13 @@ else
 fi
 expect_nonzero "verify rejects a record made from a dirty tree" verify_in "$B"
 expect_code yes record-dirty
+expect_nonzero "bundle refuses a dirty checkout" bundle_in "$B" "$WORK/bundle-dirty"
+expect_code yes dirty
+if [[ ! -e "$WORK/bundle-dirty/usbgadget.kext" ]]; then
+  note_ok "bundle writes nothing when verification fails"
+else
+  note_fail "bundle wrote a driver despite failed verification"
+fi
 expect_pass "verify --allow-dirty accepts the iteration build" verify_in "$B" --allow-dirty
 
 echo "== KDK content check"

@@ -2,6 +2,7 @@
 # Read-only preflight for the S2 policy gate. Runs the S1 source/harness gates, validates the matching
 # KDK contents, builds the kext in the tree and again from a copy at a different path (the executable
 # hashes must match), verifies the build provenance record (fails on a dirty tree or any mismatch),
+# checks that drivers/ is the byte-identical bundle with matching SHA256SUMS and PROVENANCE,
 # prints bundle/linkage diagnostics, records the public SIP state, and prints the documented rollback
 # commands. It never changes SIP, never installs, and never loads a kext. A private LocalPolicy
 # snapshot is captured only when --private-policy-out is supplied explicitly.
@@ -206,6 +207,23 @@ else
       while IFS= read -r line; do
         fail "provenance $line"
       done <<<"$problems"
+    fi
+  fi
+
+  bundle_status=0
+  "$PYTHON" "$TOOL" verify-bundle >"$OUT/verify-bundle.txt" 2>&1 || bundle_status=$?
+  bundle_summary="$(grep '^bundle:' "$OUT/verify-bundle.txt" || true)"
+  info "${bundle_summary:-bundle summary unavailable (log: $OUT/verify-bundle.txt)}"
+  if [[ "$bundle_status" -eq 0 ]]; then
+    pass "bundled driver drivers/usbgadget.kext is byte-identical to this build and drivers/PROVENANCE matches"
+  else
+    bundle_problems="$(grep '^problem:' "$OUT/verify-bundle.txt" || true)"
+    if [[ -z "$bundle_problems" ]]; then
+      fail "bundled driver verification failed (log: $OUT/verify-bundle.txt)"
+    else
+      while IFS= read -r line; do
+        fail "bundled driver $line"
+      done <<<"$bundle_problems"
     fi
   fi
 
