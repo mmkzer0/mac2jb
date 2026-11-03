@@ -3,14 +3,21 @@
 
 Standard (docs/commit-style.md):
 - Subject: imperative sentence, at most 72 characters, no trailing period, no emoji.
-  fixup!, squash!, amend!, Merge and Revert subjects are accepted unchanged.
+  fixup!, squash!, amend!, Merge and Revert subjects are accepted unchanged
+  (only the trailer ban still applies).
 - One blank line between subject and body.
 - Body prose and bullets wrap at 72 columns; continuations use two spaces.
   Indented lines, fenced code and lines containing a URL are left alone.
 - No Co-Authored-By, Signed-off-by, Reviewed-by, Acked-by or Change-Id trailers.
+
+git runs this hook before its own cleanup, so the editor template is still in
+the file: lines starting with the comment character are kept verbatim and are
+never validated, and everything from the scissors line (git commit -v) to the
+end of the file is written back byte for byte.
 """
 
 import re
+import subprocess
 import sys
 import textwrap
 
@@ -19,12 +26,27 @@ EMOJI = re.compile("[\U0001F000-\U0001FAFF\u2600-\u27BF]")
 TRAILER = re.compile(r"^(Co-Authored-By|Signed-off-by|Reviewed-by|Acked-by|Change-Id):", re.I)
 SUBJECT_PREFIX = re.compile(r"^(fixup!|squash!|amend!|Merge |Revert )")
 URL = re.compile(r"https?://")
+SCISSORS = " ------------------------ >8 ------------------------"
 
 
 def fail(message):
     print(f"commit-msg: {message}", file=sys.stderr)
     print("commit-msg: see docs/commit-style.md", file=sys.stderr)
     sys.exit(1)
+
+
+def comment_char():
+    for key in ("core.commentString", "core.commentChar"):
+        try:
+            result = subprocess.run(
+                ["git", "config", "--get", key], capture_output=True, text=True
+            )
+        except OSError:
+            return "#"
+        value = result.stdout.rstrip("\n") if result.returncode == 0 else ""
+        if value and value != "auto":
+            return value
+    return "#"
 
 
 def wrap_block(lines, indent="", width=WIDTH):
@@ -39,18 +61,22 @@ def wrap_block(lines, indent="", width=WIDTH):
     ) or [indent.rstrip()]
 
 
-def format_body(body):
+def format_body(body, cc):
     out = []
     index = 0
     in_fence = False
     while index < len(body):
+        if body[index].startswith(cc):
+            out.append(body[index])
+            index += 1
+            continue
         line = body[index].rstrip()
         if line.strip().startswith("```"):
             in_fence = not in_fence
             out.append(line)
             index += 1
             continue
-        if in_fence or line.startswith((" ", "\t")) or line.startswith("#"):
+        if in_fence or line.startswith((" ", "\t")):
             out.append(line)
             index += 1
             continue
@@ -79,7 +105,7 @@ def format_body(body):
         while (
             index < len(body)
             and body[index].strip()
-            and not body[index].startswith((" ", "\t", "- ", "```", "#"))
+            and not body[index].startswith((" ", "\t", "- ", "```", cc))
         ):
             block.append(body[index].rstrip())
             index += 1
@@ -97,19 +123,43 @@ def main():
         fail("expected the commit message path")
     path = sys.argv[1]
     try:
-        with open(path, "r", encoding="utf-8") as handle:
-            raw = handle.read()
-    except (OSError, UnicodeDecodeError) as error:
+        with open(path, "rb") as handle:
+            data = handle.read()
+    except OSError as error:
         fail(f"cannot read the message: {error}")
 
-    lines = [line.rstrip() for line in raw.replace("\r\n", "\n").replace("\r", "\n").split("\n")]
+    cc = comment_char()
+    scissors = re.search(b"^" + re.escape((cc + SCISSORS).encode("utf-8")), data, re.M)
+    tail = b""
+    if scissors:
+        data, tail = data[: scissors.start()], data[scissors.start() :]
+    try:
+        raw = data.decode("utf-8")
+    except UnicodeDecodeError as error:
+        fail(f"cannot read the message: {error}")
+
+    lines = raw.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    lines = [line if line.startswith(cc) else line.rstrip() for line in lines]
     while lines and lines[-1] == "":
         lines.pop()
-    if not lines or not lines[0].strip():
-        fail("the subject must not be empty")
 
-    subject = lines[0].strip()
-    body = lines[1:]
+    subject_index = next(
+        (i for i, line in enumerate(lines) if line.strip() and not line.startswith(cc)), None
+    )
+    if subject_index is None:
+        # Nothing but template comments: git itself aborts on the empty message.
+        return
+    prefix = lines[:subject_index]
+    subject = lines[subject_index].strip()
+    body = lines[subject_index + 1 :]
+    message_body = [line for line in body if not line.startswith(cc)]
+
+    for line in message_body:
+        if TRAILER.match(line.strip()):
+            fail(f"remove the trailer: {line.strip()}")
+
+    if SUBJECT_PREFIX.match(subject):
+        return
 
     if EMOJI.search(subject):
         fail("the subject must not contain emoji")
@@ -117,28 +167,32 @@ def main():
         fail(f"the subject is {len(subject)} characters; keep it at most {WIDTH}")
     if subject.endswith("."):
         fail("the subject must not end with a period")
-    if not SUBJECT_PREFIX.match(subject) and not subject[0].isupper():
+    if not subject[0].isupper():
         fail("the subject must start with an uppercase word")
 
-    if body:
-        if body[0] != "":
+    if message_body:
+        if message_body[0] != "":
             fail("put one blank line between the subject and the body")
-        while body and body[0] == "":
-            body.pop(0)
-        for line in body:
-            if TRAILER.match(line.strip()):
-                fail(f"remove the trailer: {line.strip()}")
+        for line in message_body:
             if EMOJI.search(line):
                 fail("the body must not contain emoji")
 
-    formatted_body = format_body(body)
+    leading_blank = bool(body) and body[0] == ""
+    formatted_body = format_body(body, cc)
     for line in formatted_body:
-        if len(line) > WIDTH and not line.startswith((" ", "\t")) and not URL.search(line):
+        if (
+            len(line) > WIDTH
+            and not line.startswith(cc)
+            and not line.startswith((" ", "\t"))
+            and not URL.search(line)
+        ):
             fail(f"body line exceeds {WIDTH} characters: {line}")
+    if leading_blank and formatted_body:
+        formatted_body.insert(0, "")
 
-    message = subject + ("\n\n" + "\n".join(formatted_body) if formatted_body else "") + "\n"
-    with open(path, "w", encoding="utf-8") as handle:
-        handle.write(message)
+    message = "\n".join(prefix + [subject] + formatted_body) + "\n"
+    with open(path, "wb") as handle:
+        handle.write(message.encode("utf-8") + tail)
 
 
 if __name__ == "__main__":

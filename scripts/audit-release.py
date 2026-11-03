@@ -643,6 +643,38 @@ with zipfile.ZipFile(archive) as z:
     except (KeyError, ValueError, TypeError, UnicodeError):
         violations.append('missing or malformed Control Center source provenance')
 
+# docs/, tests/ and .githooks/ ship as written by make-release-zip.command: only
+# files tracked by git may appear there (extension allowlist when git is not
+# available), and private policy material never may.
+SHIPPED_DIRS = ('docs', 'tests', '.githooks')
+TEXT_SUFFIXES = {'.md', '.txt', '.sh', '.py', '.cpp', '.h', '.hpp', '.c', '.cjs', '.js', '.mk', '.cmake'}
+tracked = None
+try:
+    import os
+    import subprocess
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    listing = subprocess.run(['git', '-C', repo, 'ls-files', '-z', '--', *SHIPPED_DIRS],
+                             capture_output=True, check=True).stdout
+    tracked = {entry.decode('utf-8', 'surrogateescape') for entry in listing.split(b'\0') if entry}
+except (OSError, subprocess.CalledProcessError):
+    pass
+for path in sorted(names):
+    p = PurePosixPath(path)
+    if len(p.parts) < 3 or p.parts[0] != 'mac2jb' or p.parts[1] not in SHIPPED_DIRS or path.endswith('/'):
+        continue
+    relative = '/'.join(p.parts[1:])
+    lowered = p.name.lower()
+    if 'localpolicy' in lowered or 'bputil' in lowered:
+        violations.append('private policy artifact in ' + p.parts[1] + '/: ' + path)
+    elif tracked is not None:
+        if relative not in tracked:
+            violations.append('untracked file in ' + p.parts[1] + '/: ' + path)
+    elif p.parts[1] == '.githooks':
+        if p.name != 'commit-msg':
+            violations.append('unexpected file in .githooks/: ' + path)
+    elif p.suffix.lower() not in TEXT_SUFFIXES:
+        violations.append('unapproved file type in ' + p.parts[1] + '/: ' + path)
+
 if violations:
     for v in violations:
         print('FAIL:', v, file=sys.stderr)

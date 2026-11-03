@@ -12,6 +12,9 @@ The repository uses one plain-text standard, enforced by `.githooks/commit-msg`.
   `Change-Id` trailers.
 - `fixup!`, `squash!`, `amend!`, `Merge ` and `Revert ` subjects are accepted
   unchanged for interactive rebase and merge commits.
+- Lines starting with the comment character (`core.commentChar`, default `#`)
+  are left alone, and everything from the `git commit -v` scissors line to the
+  end of the file is neither validated nor rewritten.
 
 Enable the hook once per clone:
 

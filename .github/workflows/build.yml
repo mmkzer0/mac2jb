@@ -109,6 +109,9 @@ jobs:
       - name: Verify GUI workflow transitions
         run: bash scripts/test-workflow-progress.sh
 
+      - name: Verify commit message hook
+        run: bash scripts/test-commit-msg-hook.sh
+
       - name: Verify stage-specific failure and cancellation guidance
         run: bash scripts/test-session-recovery.sh
 
