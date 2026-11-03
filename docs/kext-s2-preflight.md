@@ -90,6 +90,10 @@ rejects `-n`. Use `kmutil print-diagnostics`.
 Run of 2026-11-03 on the clean commit `56668dc` (exit 0, no blockers). The S2
 acceptance rerun on `2f1b6db` (after the policy gate, kext source unchanged)
 also exits 0 with no blockers and the same source digest and executable hash.
+The S3 entry run on `102ed45`, the first commit whose `drivers/` holds the
+hardened build, exits 0 with no blockers; its bundled-driver check passes
+(byte-identical bundle, `PROVENANCE` matches, LC_UUID
+`CF8E2A1A-9710-3430-998D-21A0E845D8B2`).
 
 | Check | Result |
 |---|---|
