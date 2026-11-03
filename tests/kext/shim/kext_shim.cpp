@@ -46,6 +46,8 @@ std::atomic<unsigned long> g_trace_seq(0);
 std::atomic<unsigned> g_next_thread_id(1);
 thread_local unsigned tls_thread_id = 0;
 thread_local bool tls_is_worker = false;
+thread_local thread_t tls_thread = THREAD_NULL;  // the worker's own thread record
+thread_local bool tls_woke_sleeper = false;      // worker woke an IOLockSleep waiter since its last unlock
 
 unsigned current_thread_id() {
     if (tls_thread_id == 0) tls_thread_id = g_next_thread_id.fetch_add(1);
@@ -197,8 +199,14 @@ void violation(const char *fmt, ...) {
     va_end(ap);
 }
 
+bool worker_released_by_owner();  // defined with struct thread below
+
 void trace_event(const char *op, long result) {
-    if (g_quiescent.load() && tls_is_worker) {
+    if (tls_is_worker && worker_released_by_owner()) {
+        // The owner already reaped this worker, so in XNU it may have freed the object the worker uses.
+        ++g_stats.post_teardown_ops;
+        violation("worker thread called %s after its owner released it with thread_deallocate", op);
+    } else if (g_quiescent.load() && tls_is_worker) {
         ++g_stats.post_teardown_ops;
         violation("worker thread called %s after stop()/free() returned", op);
     }
@@ -226,9 +234,9 @@ void dump_trace(FILE *out, unsigned count) {
 }
 
 void mark_quiescent() {
-    if (g_stats.workers_running.load() != 0)
-        violation("worker still running when the object reported stopped/freed (%ld running)",
-                  g_stats.workers_running.load());
+    if (g_stats.threads_started.load() != g_stats.thread_deallocs.load())
+        violation("object reported stopped/freed with %ld started worker(s) never released",
+                  g_stats.threads_started.load() - g_stats.thread_deallocs.load());
     g_quiescent = true;
 }
 
@@ -570,6 +578,13 @@ void IOLockUnlock(IOLock *lock) {
     ++lock->releases;
     --g_stats.locks_held;
     pthread_mutex_unlock(&lock->mutex);
+    if (tls_is_worker && tls_woke_sleeper) {
+        // Adversarial preemption: a worker that woke a sleeper (e.g. a teardown waiting for the worker to
+        // finish) stalls here until its owner releases it, so any later worker access to the owner's
+        // state happens after thread_deallocate and is reported instead of hidden by timing.
+        tls_woke_sleeper = false;
+        for (int i = 0; i < 2000 && !worker_released_by_owner(); ++i) usleep(50);
+    }
     maybe_yield();
 }
 
@@ -598,15 +613,18 @@ void IOLockWakeup(IOLock *lock, void *event, bool oneThread) {
     if (!lock_usable(lock, "IOLockWakeup")) return;
     bool owned = lock->owner.load() == self_id();
     if (!owned) pthread_mutex_lock(&lock->mutex);
+    bool woke = false;
     for (size_t i = 0; i < lock->waiters.size();) {
         if (lock->waiters[i]->event == event) {
             lock->waiters[i]->signaled = true;
             lock->waiters.erase(lock->waiters.begin() + i);
+            woke = true;
             if (oneThread) break;
         } else {
             ++i;
         }
     }
+    if (woke && tls_is_worker) tls_woke_sleeper = true;
     pthread_cond_broadcast(&lock->cond);
     if (!owned) pthread_mutex_unlock(&lock->mutex);
 }
@@ -618,9 +636,12 @@ void IOLockWakeup(IOLock *lock, void *event, bool oneThread) {
 struct thread {
     pthread_t handle;
     std::atomic<int> dealloc_calls;
+    std::atomic<bool> joined;
     thread_continue_t fn;
     void *arg;
 };
+
+bool kext_shim::worker_released_by_owner() { return tls_thread != THREAD_NULL && tls_thread->dealloc_calls.load() > 0; }
 
 namespace {
 pthread_mutex_t g_thread_registry_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -631,10 +652,13 @@ std::vector<thread *> &thread_registry() {
 
 void *thread_trampoline(void *p) {
     thread *t = static_cast<thread *>(p);
+    tls_thread = t;
     set_worker_thread(true);
     ++g_stats.workers_running;
     trace_event("worker_start", 0);
     t->fn(t->arg, 0);
+    // The continuation has returned; the remaining calls are the shim's own thread exit, not kext code.
+    set_worker_thread(false);
     trace_event("worker_end", 0);
     --g_stats.workers_running;
     return NULL;
@@ -647,6 +671,7 @@ kern_return_t kernel_thread_start(thread_continue_t continuation, void *paramete
     if (injected) return KERN_FAILURE;
     thread *t = new thread;
     t->dealloc_calls = 0;
+    t->joined = false;
     t->fn = continuation;
     t->arg = parameter;
     if (pthread_create(&t->handle, NULL, thread_trampoline, t) != 0) {
@@ -671,9 +696,18 @@ void thread_deallocate(thread_t t) {
         violation("thread_deallocate called more than once for one thread");
         return;
     }
-    // Reaping includes waiting for the body to return, so no code runs after the owner frees itself.
-    pthread_join(t->handle, NULL);
+    // XNU drops the reference only; the worker may still be running. reap_released_threads() joins it.
     ++g_stats.thread_deallocs;
+}
+
+void kext_shim::reap_released_threads() {
+    std::vector<thread *> released;
+    pthread_mutex_lock(&g_thread_registry_lock);
+    for (thread *t : thread_registry()) {
+        if (t->dealloc_calls.load() > 0 && !t->joined.exchange(true)) released.push_back(t);
+    }
+    pthread_mutex_unlock(&g_thread_registry_lock);
+    for (thread *t : released) pthread_join(t->handle, NULL);
 }
 
 void IOSleepWithLeeway(unsigned int intervalMilliseconds, unsigned int leewayMilliseconds) {
@@ -707,7 +741,14 @@ void kprintf(const char *format, ...) { (void)format; }
 // IOService / IOUserClient
 // ---------------------------------------------------------------------------
 
-IOService::IOService() : shim_start_calls(0), shim_stop_calls(0), shim_register_calls(0), properties_(NULL) {}
+IOService::IOService()
+    : shim_start_calls(0),
+      shim_stop_calls(0),
+      shim_register_calls(0),
+      shim_terminate_calls(0),
+      properties_(NULL),
+      shim_inactive_(false),
+      shim_provider_(NULL) {}
 
 IOService::~IOService() {}
 
@@ -745,6 +786,40 @@ void IOService::stop(IOService *provider) {
     (void)provider;
     trace_event("IOService::stop", 0);
     ++shim_stop_calls;
+}
+
+bool IOService::attach(IOService *provider) {
+    trace_event("IOService::attach", provider != NULL);
+    if (!provider || shim_provider_) return false;
+    retain();
+    provider->retain();
+    shim_provider_ = provider;
+    return true;
+}
+
+void IOService::detach(IOService *provider) {
+    trace_event("IOService::detach", 0);
+    if (!provider || provider != shim_provider_) {
+        violation("detach from a provider this service is not attached to");
+        return;
+    }
+    shim_provider_ = NULL;
+    provider->release();
+    release();  // may free this service; nothing may touch it afterwards
+}
+
+bool IOService::terminate(IOOptionBits options) {
+    (void)options;
+    trace_event("IOService::terminate", 0);
+    ++shim_terminate_calls;
+    return !shim_inactive_.exchange(true);
+}
+
+void kext_shim::complete_termination(IOService *service) {
+    if (!service || !service->isInactive() || !service->shim_provider_) return;
+    IOService *provider = service->shim_provider_;
+    service->stop(provider);
+    service->detach(provider);
 }
 
 // Models the call a driver makes into its provider: the harness can fail it with kOpSetProperties.

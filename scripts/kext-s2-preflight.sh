@@ -1,26 +1,66 @@
 #!/bin/bash
-# Read-only preflight for the S2 policy gate. Builds the kext twice to test
-# reproducibility, runs the S1 source/harness gates, checks the matching KDK,
-# prints bundle/linkage diagnostics, records the public SIP state, and prints
-# the documented rollback commands. It never changes SIP, never installs, and
-# never loads a kext. A private LocalPolicy snapshot is captured only when
-# --private-policy-out is supplied explicitly.
+# Read-only preflight for the S2 policy gate. Runs the S1 source/harness gates, validates the matching
+# KDK contents, builds the kext in the tree and again from a copy at a different path (the executable
+# hashes must match), verifies the build provenance record (fails on a dirty tree or any mismatch),
+# prints bundle/linkage diagnostics, records the public SIP state, and prints the documented rollback
+# commands. It never changes SIP, never installs, and never loads a kext. A private LocalPolicy
+# snapshot is captured only when --private-policy-out is supplied explicitly.
 #
-# Usage: scripts/kext-s2-preflight.sh [--private-policy-out <private-path>]
+# Usage: scripts/kext-s2-preflight.sh [--private-policy-out <private-path>] [--validate-only]
+#   --validate-only  check the arguments (including the private path) and exit before any work.
 set -euo pipefail
 PATH=/usr/bin:/bin:/usr/sbin:/sbin
 export PATH
 
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+ROOT="$(cd "$(dirname "$0")/.." && pwd -P)"
 OUT="$ROOT/build/kext-s2-preflight"
 REPORT="$OUT/preflight.md"
 ARTIFACT="$ROOT/build/kext/usbgadget.kext"
 EXECUTABLE="$ARTIFACT/Contents/MacOS/usbgadget"
+RECORD="$ROOT/build/kext/provenance.json"
+PYTHON=/usr/bin/python3
+TOOL="$ROOT/scripts/kext-provenance.py"
 PRIVATE_POLICY_OUT=""
+VALIDATE_ONLY=0
 
 usage() {
-  echo "usage: $0 [--private-policy-out <private-path>]"
-  echo "  The private path must be outside the repository; its contents are never printed."
+  echo "usage: $0 [--private-policy-out <private-path>] [--validate-only]"
+  echo "  The private path must be an absolute file path outside the repository; its contents are never printed."
+}
+
+die_usage() {
+  echo "$1" >&2
+  exit 2
+}
+
+# True when the directory $1 is the repository root or lies below it. Resolves symlinks and compares
+# inodes (-ef), so '..', '//', symlinks into the repo and case variants on APFS cannot slip past.
+# An unresolvable directory counts as inside (fail closed).
+path_inside_repo() {
+  local dir
+  dir="$(cd -P -- "$1" 2>/dev/null && pwd -P)" || return 0
+  while :; do
+    if [[ "$dir" -ef "$ROOT" ]]; then
+      return 0
+    fi
+    if [[ "$dir" == "/" ]]; then
+      return 1
+    fi
+    dir="$(dirname -- "$dir")"
+  done
+}
+
+validate_private_path() {
+  local path="$1" parent
+  [[ "$path" == /* ]] || die_usage "private LocalPolicy path must be absolute and outside the repository"
+  [[ "$path" != */ ]] || die_usage "private LocalPolicy path must name a file, not a directory"
+  parent="$(dirname -- "$path")"
+  [[ -d "$parent" ]] || die_usage "private LocalPolicy parent directory does not exist: $parent"
+  [[ ! -L "$path" ]] || die_usage "refusing to write the private LocalPolicy snapshot through a symlink: $path"
+  [[ ! -d "$path" ]] || die_usage "private LocalPolicy path is a directory: $path"
+  if path_inside_repo "$parent"; then
+    die_usage "refusing to write the private LocalPolicy snapshot inside the repository: $path"
+  fi
 }
 
 while [[ $# -gt 0 ]]; do
@@ -29,6 +69,10 @@ while [[ $# -gt 0 ]]; do
       [[ $# -ge 2 ]] || { usage >&2; exit 2; }
       PRIVATE_POLICY_OUT="$2"
       shift 2
+      ;;
+    --validate-only)
+      VALIDATE_ONLY=1
+      shift
       ;;
     -h|--help)
       usage
@@ -40,6 +84,13 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+if [[ -n "$PRIVATE_POLICY_OUT" ]]; then
+  validate_private_path "$PRIVATE_POLICY_OUT"
+fi
+if [[ "$VALIDATE_ONLY" -eq 1 ]]; then
+  exit 0
+fi
 
 if [[ "$(id -u)" -eq 0 ]]; then
   echo "run this preflight as the build user, not root" >&2
@@ -55,6 +106,17 @@ pass() { record "- PASS: $*"; }
 fail() { failures=$((failures + 1)); record "- FAIL: $*"; }
 info() { record "- INFO: $*"; }
 section() { printf '\n## %s\n\n' "$*" >> "$REPORT"; }
+
+# json_field <file> <dotted.key>: print one value of a JSON file.
+json_field() {
+  "$PYTHON" -c '
+import json, sys
+value = json.load(open(sys.argv[1]))
+for key in sys.argv[2].split("."):
+    value = value[key]
+print(value)
+' "$1" "$2"
+}
 
 host_version="$(sw_vers -productVersion 2>/dev/null || true)"
 host_build="$(sw_vers -buildVersion 2>/dev/null || true)"
@@ -84,7 +146,6 @@ fi
 
 section "KDK"
 kdk_root="/Library/Developer/KDKs"
-expected_kdk="$kdk_root/KDK_${host_version}_${host_build}.kdk"
 installed_kdks=""
 if [[ -d "$kdk_root" ]]; then
   while IFS= read -r path; do
@@ -95,10 +156,13 @@ if [[ -d "$kdk_root" ]]; then
     installed_kdks+="$(basename "$path")"
   done < <(find "$kdk_root" -maxdepth 1 -mindepth 1 -type d -name 'KDK_*.kdk' -print 2>/dev/null | sort)
 fi
-if [[ -d "$expected_kdk" ]]; then
-  pass "matching KDK present: $(basename "$expected_kdk")"
+if [[ -z "$host_version" || -z "$host_build" ]]; then
+  fail "host version/build unknown; cannot select the matching KDK"
+elif "$PYTHON" "$TOOL" kdk-check --kdk-root "$kdk_root" \
+  --product-version "$host_version" --product-build "$host_build" >"$OUT/kdk-check.txt" 2>&1; then
+  pass "matching KDK present and valid: $(cat "$OUT/kdk-check.txt")"
 else
-  fail "matching KDK missing: $(basename "$expected_kdk") (install it from developer.apple.com; do not use --allow-missing-kdk)"
+  fail "matching KDK KDK_${host_version}_${host_build}.kdk missing or invalid (install it from developer.apple.com; do not use --allow-missing-kdk): $(tr '\n' ';' <"$OUT/kdk-check.txt")"
 fi
 if [[ -n "$installed_kdks" ]]; then
   info "installed KDKs: $installed_kdks"
@@ -118,24 +182,52 @@ else
   fail "mock harness failed (log: $OUT/harness.log)"
 fi
 
-section "Reproducible build"
+section "Build, provenance and path independence"
+hash1=""
 if ! bash "$ROOT/scripts/build-kext.sh" >"$OUT/build-1.log" 2>&1; then
-  fail "first build failed (log: $OUT/build-1.log)"
+  fail "in-tree build failed (log: $OUT/build-1.log)"
+elif [[ ! -f "$EXECUTABLE" || ! -f "$RECORD" ]]; then
+  fail "build did not produce $EXECUTABLE and $RECORD"
 else
-  if [[ ! -f "$EXECUTABLE" ]]; then
-    fail "build did not produce $EXECUTABLE"
+  hash1="$(shasum -a 256 "$EXECUTABLE" | awk '{print $1}')"
+  info "in-tree executable: $(stat -f '%z' "$EXECUTABLE") bytes, SHA-256 $hash1"
+  info "recorded toolchain: Xcode $(json_field "$RECORD" toolchain.xcode) ($(json_field "$RECORD" toolchain.xcode_build)); SDK $(json_field "$RECORD" toolchain.sdk.version) ($(json_field "$RECORD" toolchain.sdk.build)); DEVELOPER_DIR override: $(json_field "$RECORD" toolchain.developer_dir_override)"
+  verify_status=0
+  "$PYTHON" "$TOOL" verify >"$OUT/verify.txt" 2>&1 || verify_status=$?
+  summary="$(grep '^provenance:' "$OUT/verify.txt" || true)"
+  info "${summary:-provenance summary unavailable (log: $OUT/verify.txt)}"
+  if [[ "$verify_status" -eq 0 ]]; then
+    pass "provenance record verifies: clean tree, source digest, build script and artifact match"
   else
-    hash1="$(shasum -a 256 "$EXECUTABLE" | awk '{print $1}')"
-    if ! bash "$ROOT/scripts/build-kext.sh" >"$OUT/build-2.log" 2>&1; then
-      fail "second build failed (log: $OUT/build-2.log)"
+    problems="$(grep '^problem:' "$OUT/verify.txt" || true)"
+    if [[ -z "$problems" ]]; then
+      fail "provenance verify failed (log: $OUT/verify.txt)"
     else
-      hash2="$(shasum -a 256 "$EXECUTABLE" | awk '{print $1}')"
-      if [[ "$hash1" == "$hash2" ]]; then
-        pass "two clean builds produced the same executable hash"
-      else
-        fail "two clean builds produced different hashes: $hash1 vs $hash2"
-      fi
-      info "executable: $(stat -f '%z' "$EXECUTABLE") bytes, SHA-256 $hash2"
+      while IFS= read -r line; do
+        fail "provenance $line"
+      done <<<"$problems"
+    fi
+  fi
+
+  rm -rf -- "$OUT/path-check"
+  copy_root="$OUT/path-check/independent copy/mac2jb checkout"
+  if ! "$PYTHON" "$TOOL" export-checkout --dest "$copy_root" >"$OUT/export-checkout.log" 2>&1; then
+    fail "could not export a checkout copy (log: $OUT/export-checkout.log)"
+  elif ! bash "$copy_root/scripts/build-kext.sh" >"$OUT/build-2.log" 2>&1; then
+    fail "build from the copy at a different path failed (log: $OUT/build-2.log)"
+  else
+    hash2="$(shasum -a 256 "$copy_root/build/kext/usbgadget.kext/Contents/MacOS/usbgadget" | awk '{print $1}')"
+    if [[ "$hash1" == "$hash2" ]]; then
+      pass "build from a copy at a different path (with a space) produced the same executable hash"
+    else
+      fail "executable hash depends on the checkout path: $hash1 in-tree vs $hash2 in the copy"
+    fi
+    digest1="$(json_field "$RECORD" source.tree_sha256)"
+    digest2="$(json_field "$copy_root/build/kext/provenance.json" source.tree_sha256)"
+    if [[ "$digest1" == "$digest2" ]]; then
+      pass "source digest of the copy equals the in-tree source digest"
+    else
+      fail "source digest differs between the tree ($digest1) and its copy ($digest2)"
     fi
   fi
 fi
@@ -169,18 +261,15 @@ if [[ -d "$ARTIFACT" ]]; then
     info "bundle signing state could not be classified"
   fi
 
-  diagnostic_args=(-p "$ARTIFACT" -z)
-  if [[ -d "$expected_kdk" ]]; then
-    diagnostic_args+=(--kdk "$expected_kdk")
-    info "load diagnostics use $(basename "$expected_kdk")"
-  fi
-  if kmutil print-diagnostics "${diagnostic_args[@]}" >"$OUT/kmutil-diagnostics.txt" 2>&1; then
+  # kmutil's dependency resolution is a bundle-linkage diagnostic only: its result is identical with
+  # no KDK, a wrong KDK or an empty directory, so it is not evidence about the KDK (see the KDK section).
+  if kmutil print-diagnostics -p "$ARTIFACT" -z >"$OUT/kmutil-diagnostics.txt" 2>&1; then
     :
   fi
   if grep -q "Dependencies: OK" "$OUT/kmutil-diagnostics.txt"; then
-    pass "kext dependency resolution"
+    pass "bundle linkage: declared kext dependencies resolve on this system (kmutil print-diagnostics; not KDK evidence)"
   else
-    fail "kext dependency resolution failed (log: $OUT/kmutil-diagnostics.txt)"
+    fail "bundle linkage: kext dependency resolution failed (log: $OUT/kmutil-diagnostics.txt)"
   fi
   if grep -q "Filesystem error" "$OUT/kmutil-diagnostics.txt"; then
     info "user-owned build path; the installer applies root:wheel ownership"
@@ -217,16 +306,14 @@ fi
 
 section "Private policy snapshot"
 if [[ -n "$PRIVATE_POLICY_OUT" ]]; then
-  if [[ "$PRIVATE_POLICY_OUT" != /* ]]; then
-    fail "private LocalPolicy path must be absolute and outside the repository"
-  elif [[ "$PRIVATE_POLICY_OUT" == "$ROOT"/* ]]; then
-    fail "refusing to write the private LocalPolicy snapshot inside the repository"
-  elif ! command -v bputil >/dev/null 2>&1; then
+  if ! command -v bputil >/dev/null 2>&1; then
     fail "bputil not found"
   elif ! sudo -n true >/dev/null 2>&1; then
     fail "sudo requires a password; run manually: sudo bputil -d -j > <private-path>"
   else
     umask 077
+    # The redirect is deliberately performed by the unprivileged shell: the snapshot stays user-owned.
+    # shellcheck disable=SC2024
     if sudo -n bputil -d -j >"$PRIVATE_POLICY_OUT" 2>"$OUT/bputil.err"; then
       chmod 600 "$PRIVATE_POLICY_OUT"
       pass "private LocalPolicy snapshot captured (contents not printed)"

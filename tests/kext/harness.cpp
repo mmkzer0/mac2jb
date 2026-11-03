@@ -832,6 +832,50 @@ void test_userclient_poke_vs_close() {
     }
 }
 
+// IOService::newUserClient attaches the client to the gadget (initWithTask, attach, start). IOServiceClose
+// only calls clientClose(); nothing in IOKit detaches the client unless it terminates itself.
+void test_userclient_close_terminates() {
+    // A: IOServiceClose, IOKit's termination thread, then the last connection reference goes away.
+    {
+        gay_bowser_usbgadget *g = new_gadget();
+        const long live_before = g_stats.live_objects.load();
+        gay_bowser_usbgadget_userclient *uc = new_userclient();
+        CHECK(uc->attach(g));
+        CHECK(uc->start(g));
+        CHECK(poke(uc) == kIOReturnSuccess);
+
+        CHECK(uc->clientClose() == kIOReturnSuccess);
+        CHECKF(uc->isInactive(), "clientClose did not terminate the client; it stays attached to the gadget");
+        CHECK(poke(uc) == kIOReturnNotReady);
+        complete_termination(uc);
+        uc->release();
+
+        CHECKF(g->getRetainCount() == 1, "gadget refcount %d after close; the client is still attached",
+               g->getRetainCount());
+        CHECKF(g_stats.live_objects.load() == live_before, "%ld object(s) left after open/close",
+               g_stats.live_objects.load() - live_before);
+        g->release();
+    }
+    // B: the gadget terminates its attached client first; the later IOServiceClose must not release or
+    //    terminate twice.
+    {
+        gay_bowser_usbgadget *g = new_gadget();
+        gay_bowser_usbgadget_userclient *uc = new_userclient();
+        CHECK(uc->attach(g));
+        CHECK(uc->start(g));
+        CHECK(uc->terminate());  // IOKit terminating the gadget's clients
+        complete_termination(uc);
+        CHECK(uc->shim_stop_calls.load() == 1);
+        CHECK(uc->m_provider == NULL);
+        CHECK(uc->clientClose() == kIOReturnSuccess);
+        CHECK(uc->shim_terminate_calls.load() == 2);
+        CHECK(uc->shim_stop_calls.load() == 1);
+        CHECK(g->getRetainCount() == 1);
+        uc->release();
+        g->release();
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Test 7: stop waits for an in-flight controller call and does not hold m_pokeLock during it
 // ---------------------------------------------------------------------------
@@ -1231,6 +1275,7 @@ bool run_trial(Teardown td, Op op, unsigned long n, bool sticky, uint64_t seed, 
     arm_op_failure(op, n, sticky);
     ScenarioResult r;
     run_scenario(td, f, r);
+    reap_released_threads();
     const bool fired = op_failure_fired(op);
     const int fired_step = op_failure_step(op);
     disarm_op_failures();
@@ -1336,6 +1381,7 @@ const TestCase kTests[] = {
     {"6c_userclient_poke_reaches_gadget", test_userclient_poke_reaches_gadget},
     {"6d_userclient_orderings", test_userclient_orderings},
     {"6e_userclient_poke_vs_close", test_userclient_poke_vs_close},
+    {"6f_userclient_close_terminates", test_userclient_close_terminates},
     {"7_stop_waits_for_controller", test_stop_waits_for_controller},
     {"7b_controller_reentrancy", test_controller_reentrancy},
     {"7c_concurrent_publish", test_concurrent_publish},
@@ -1356,6 +1402,7 @@ void run_child(const TestCase &t) {
     long live_baseline = g_stats.live_objects.load();
 
     t.fn();
+    reap_released_threads();
 
     CHECKF(g_stats.violations.load() == 0, "%ld shim violation(s) reported", g_stats.violations.load());
     CHECKF(g_stats.post_teardown_ops.load() == 0, "%ld shim call(s) from a worker after teardown",

@@ -1,30 +1,136 @@
 # Kext build provenance (S0, S1, S1.1)
 
-Status: build and hardening evidence.
-Capture: 2026-11-01, branch `dev`, host macOS 27.0 (26A428),
-Xcode 27.2 (27B52), SDK `MacOSX27.2.sdk`.
+Status: build and hardening evidence; the build contract below is enforced by
+`scripts/build-kext.sh`, `scripts/kext-provenance.py` and
+`scripts/test-kext-provenance.sh`.
+Capture: 2026-11-03, host macOS 27.0 (26A428), Xcode 27.2 (27B52), SDK
+`MacOSX27.2.sdk` (26B118).
 
 The shipped `drivers/usbgadget.kext` was built by the upstream maintainer with
 Xcode 2660 / SDK 26.5 in a Debug configuration (evidence below). Our artifacts
 are Release builds from the vendored source with the current toolchain.
-Byte-identical reproduction is **not** claimed; every observed difference is
-explained or bounded.
+Byte-identical reproduction of the *shipped* binary is **not** claimed; every
+observed difference is explained or bounded. Reproduction of *our own* build is
+claimed and tested, within the limits listed at the end.
 
-## Reproduce
+## Build contract
+
+`bash scripts/build-kext.sh` produces `build/kext/usbgadget.kext` and
+`build/kext/provenance.json`. The executable's SHA-256 is a function of the
+git-tracked kext source and the toolchain only:
+
+- **Source:** only the files `git ls-files` lists under
+  `vendor/macos_usb_gadget_poc/usbgadget` are copied to `build/kext/src` and
+  compiled. Ignored files (`.DS_Store`, `xcuserdata`, `*.xcuserstate`) and
+  untracked scratch files never reach the compiler and never change the source
+  digest.
+- **Environment:** `xcodebuild`, `xcrun` and the provenance tool run under
+  `env -i` with an allowlist: `PATH`, `LANG=C`, a `HOME` and `TMPDIR` inside
+  `build/kext` (so user-wide Xcode defaults and `~/Library/Developer/Xcode`
+  caches cannot influence the build), and `DEVELOPER_DIR` only when the operator
+  exported it (the record keeps it). `OTHER_CFLAGS`, `GCC_OPTIMIZATION_LEVEL`,
+  `SDKROOT` and similar variables in the calling shell are ignored.
+- **Path independence:** the build runs with
+  `GCC_GENERATE_DEBUGGING_SYMBOLS=NO`. With debug information the Mach-O symbol
+  table carried `SO`/`OSO` stabs naming `build/kext/obj/...` (so the hash
+  changed with the checkout path and embedded the builder's home directory) and
+  the LC_UUID, which is derived from the content, changed with it. Without debug
+  information no dSYM is produced and the executable is identical from any
+  checkout path. The cost is that no dSYM exists for the built kext; the
+  executable keeps its defined and undefined symbols, only the debug stabs
+  are gone.
+- **Dirty trees:** a dirty build still succeeds for iteration. The record says
+  `dirty: true`; dirty means a tracked modification or an untracked,
+  non-ignored file under the kext source directory or `scripts/build-kext.sh`.
+  `verify` and the S2 preflight reject it.
+
+`provenance.json` (`format: mac2jb-kext-provenance-v2`) records:
+
+| Field | Content |
+|---|---|
+| `git` | `commit`, `branch`, `dirty`, `dirty_paths` of the build inputs |
+| `source` | per-file SHA-256 of the tracked files, and `tree_sha256` over sorted `<path>\0<sha256>\n` lines |
+| `build` | the non-path `xcodebuild` arguments, the build script path and its SHA-256 |
+| `toolchain` | `xcodebuild -version` (Xcode version and build), `xcrun` SDK path/version/build, clang, the `DEVELOPER_DIR` override (or `null`), and the `xcodebuild -showBuildSettings` values actually used (`SDK_NAME`, `SDK_VERSION`, `SDK_PRODUCT_BUILD_VERSION`, `XCODE_PRODUCT_BUILD_VERSION`, `MACOSX_DEPLOYMENT_TARGET`, `SDKROOT`, ...) |
+| `kdk` | the `KDK_<version>_<build>.kdk` matching the host: name, `SystemVersion.plist` version/build and SHA-256, arm64 release kernels, `valid`/`problems` |
+| `host` | `sw_vers` product, version and build |
+| `artifact` | per-file SHA-256 of the bundle, executable hash/size/arch, `Info.plist` hash, signing state |
+
+`record` is invoked only by `build-kext.sh`, right after the build. It compares
+the digest of the working-tree source with the digest of `build/kext/src` (what
+was compiled) and refuses to write a record when they differ, so a source edit
+between the compile and the record cannot produce one.
+
+## Reproduce and verify
 
 ```sh
 bash scripts/build-kext.sh
-python3 scripts/kext-provenance.py record \
-  --artifact build/kext/usbgadget.kext \
-  --source vendor/macos_usb_gadget_poc/usbgadget \
-  --output build/kext/provenance.json
+python3 scripts/kext-provenance.py verify          # exits non-zero on any problem
+bash scripts/test-kext-provenance.sh               # regression tests (about 15 s)
 python3 scripts/kext-provenance.py report \
   --artifact build/kext/usbgadget.kext \
   --shipped drivers/usbgadget.kext \
   --source vendor/macos_usb_gadget_poc/usbgadget
 ```
 
-Debug reference (used to explain the shipped binary's code size):
+`verify` prints `provenance: commit=... dirty=... source_sha256=...
+executable_sha256=...` and one `problem: <code>: <detail>` line per failure:
+
+| Code | Meaning |
+|---|---|
+| `record` | record missing, unreadable or of another format |
+| `dirty` | the build inputs have uncommitted changes now |
+| `record-dirty` | the artifact was built from a dirty tree |
+| `source-digest` | the tracked source no longer equals the recorded digest (edit after the build, committed or not) |
+| `build-script` | `build-kext.sh` differs from the script that built the artifact |
+| `artifact-hash`, `artifact-files` | the executable or any bundle file changed, or files were added or removed |
+
+`--allow-dirty` downgrades `dirty` and `record-dirty` to notes (the iteration
+build runs this as a self-check). `kext-provenance.py kdk-check` validates a
+KDK directory by content (see `kext-s2-preflight.md`). `export-checkout --dest
+<dir>` copies the build inputs of the working tree into a fresh one-commit git
+repository at another path; the preflight and the tests use it for the
+path-independence check.
+
+### Limits
+
+- The record pins *which* Xcode, SDK and KDK were used; it does not require a
+  particular one. A different Xcode builds a different binary and verifies
+  against its own record; compare `toolchain` before treating two records as
+  equivalent.
+- The KDK is not an input of the build. It is recorded because the AuxKC
+  rebuild at install time needs the matching one.
+- `verify` proves the artifact still equals what was recorded and that the
+  source and script still equal what was compiled. It does not rebuild; the
+  preflight rebuilds from a copy at another path.
+- `build-kext.sh` requires a git checkout rooted at the repository (the record
+  names a commit); a source zip without `.git` cannot build the kext.
+
+## Current build
+
+Captured by the 2026-11-03 build from the working tree of branch `dev`. The
+record of that build states: commit `0e7addbc495dc2d98e18b8b4b63c6a6a47de28cb`
+with `dirty: true` (uncommitted edits to `usbgadget_userclient.cpp` and
+`scripts/build-kext.sh`), source `tree_sha256`
+`8987e0c90680e7a1f57e646c0cd8a9a339bced3cf737fec4a37f45e5d09a3e11`, executable
+`109296` bytes, SHA-256
+`de79702967e272694568d6545f4e131bfcf0b21509c1cc3aab8c4c4c572674c5`,
+`Info.plist` SHA-256
+`a4ca368ce107273aaf008a8dd68d1de898eb9889c5efc6e56ea76601912ce0bd`, Xcode 27.2
+(27B52), SDK 27.2 (26B118). The same executable hash came out of the in-tree
+build, of exported copies at differently named paths (one containing a space)
+and of a build with hostile `OTHER_CFLAGS`/`GCC_OPTIMIZATION_LEVEL`/
+`MACOSX_DEPLOYMENT_TARGET` in the environment. The record proves this digest and
+this executable correspond; because it is dirty it does not name a commit that
+contains this source. Rebuild from a clean commit and run `verify` to obtain a
+record that does. The hash in earlier revisions of this document
+(`644fda29...`) predates the path-independent build and the later source edits
+and is obsolete.
+
+## Comparison with the shipped kext
+
+Debug reference (used to explain the shipped binary's code size; not under
+provenance control):
 
 ```sh
 D="$(mktemp -d)"
@@ -35,15 +141,16 @@ xcodebuild -project usbgadget.xcodeproj -configuration Debug -sdk macosx \
   SYMROOT="$D/sym" OBJROOT="$D/obj" build
 ```
 
-## S1.1 hardened build
+Output of `report` for the build above (the built kext is a Release build
+without debug information; the shipped one is Debug):
 
 ```text
 ## Artifacts
 
 - Built: `build/kext/usbgadget.kext`
-  - Total size: 116616 bytes
-  - Executable: `Contents/MacOS/usbgadget` (114360 bytes)
-    - SHA256: `644fda29022f7152ab11c029b4bf342160180af364ce8748ad965a0bd0626fd0`
+  - Total size: 111552 bytes
+  - Executable: `Contents/MacOS/usbgadget` (109296 bytes)
+    - SHA256: `de79702967e272694568d6545f4e131bfcf0b21509c1cc3aab8c4c4c572674c5`
   - Info.plist: `Contents/Info.plist` (2256 bytes)
     - SHA256: `a4ca368ce107273aaf008a8dd68d1de898eb9889c5efc6e56ea76601912ce0bd`
 - Shipped: `drivers/usbgadget.kext`
@@ -92,7 +199,7 @@ xcodebuild -project usbgadget.xcodeproj -configuration Debug -sdk macosx \
   - `__DATA_CONST,__got`: built 80 bytes, shipped 56 bytes (+24 bytes)
   - `__TEXT,__cstring`: built 1100 bytes, shipped 835 bytes (+265 bytes)
   - `__TEXT_EXEC,__auth_stubs`: built 432 bytes, shipped 400 bytes (+32 bytes)
-  - `__TEXT_EXEC,__text`: built 6892 bytes, shipped 6764 bytes (+128 bytes)
+  - `__TEXT_EXEC,__text`: built 6956 bytes, shipped 6764 bytes (+192 bytes)
 
 ## Defined symbols
 
@@ -132,12 +239,13 @@ These artifacts were built with different Xcode/SDK versions; byte-identical rep
 
 - The six new imports are all kernel exports: `_IOLockSleep`, `_IOLockWakeup`,
   `IORegistryEntry::setProperties`, `OSString::metaClass`,
-  `OSSymbol::metaClass` and `IOService::metaClass` are present in the KDK 26.0
-  kernel symbol table. The three removed imports were the dead user-client
-  `setProperties` symbol and the base `IOUserClient::clientClose`/`free` stubs;
-  the hardened code implements both explicitly.
-- `__TEXT_EXEC,__text` is 6892 bytes against the shipped 6764 (+128) and the S0
-  Release build's 5220. The hardening adds roughly 1.6 KiB; the explicit
+  `OSSymbol::metaClass` and `IOService::metaClass`. The three removed imports
+  were the dead user-client `setProperties` symbol and the base
+  `IOUserClient::clientClose`/`free` stubs; the hardened code implements both
+  explicitly. With `clientClose` calling `terminate()`, all 354 imports of the
+  current build resolve against the arm64 KDK 27.0 (`26A428`) release kernels.
+- `__TEXT_EXEC,__text` is 6956 bytes against the shipped 6764 (+192) and the S0
+  Release build's 5220. The hardening adds about 1.7 KiB; the explicit
   publication lock and its allocation-failure log are part of that delta. The
   shipped binary remains a Debug build (see below), so size alone is not
   behavioral equivalence.
@@ -158,7 +266,9 @@ These artifacts were built with different Xcode/SDK versions; byte-identical rep
 
 The pre-hardening Release build (`ef1dcf6e…`, executable 113552 bytes,
 `__TEXT_EXEC,__text` 5220 bytes) had 351/351 identical undefined symbols and
-18/18 identical strings of at least 8 bytes against the shipped binary.
+18/18 identical strings of at least 8 bytes against the shipped binary. That
+build and the first S1.1 build carried debug stabs and were not
+path-independent; their sizes (113552 and 114360 bytes) include them.
 
 The shipped binary matches a **Debug** (`-O0`) build of the same source under
 the current toolchain: `__TEXT_EXEC,__text` 6824 bytes (0.9 percent above the
@@ -170,7 +280,9 @@ best-supported explanation for the code-size delta.
 
 ## Consequence
 
-The source-to-artifact chain is reproducible on this host, and every
-difference to the shipped binary is either a deliberate hardening change or a
-toolchain/configuration artifact. Behavioral equivalence still rests on the S1
-mock-IOKit harness and the S3 hardware test, not on this comparison.
+The source-to-artifact chain is reproducible on this host from any checkout
+path, is bound to the git-tracked source and the recorded toolchain by
+`provenance.json`, and every difference to the shipped binary is either a
+deliberate hardening change or a toolchain/configuration artifact. Behavioral
+equivalence still rests on the S1 mock-IOKit harness and the S3 hardware test,
+not on this comparison.

@@ -1,9 +1,12 @@
 # S2 preflight (no SIP change)
 
-Status: executed on 2026-11-02. The preflight passes after installing
-`KDK_27.0_26A428.kdk`; the private LocalPolicy snapshot is captured privately
-and matches the documented baseline. The S2 policy gate has not been applied.
-No SIP change, install, unload or kext load was performed.
+Status: the 2026-11-02 run passed under the earlier contract (same-path double
+build, KDK presence by directory name). The preflight has since been
+tightened (path-independent build, provenance verification, KDK content check,
+resolved private path); the checks are described below. The private LocalPolicy
+snapshot is captured privately and matches the documented baseline; the S2
+policy gate has not been applied. No SIP change, install, unload or kext load
+was performed by the preflight.
 
 **Private policy snapshot (2026-11-02):** one UUID node with 42 fields, mode
 `0600`, stored outside the repository. It confirms `security_mode: permissive`,
@@ -23,19 +26,45 @@ mock-IOKit harness or the S3 hardware gate.
 scripts/kext-s2-preflight.sh
 # Optional, after explicit approval; keep the output outside the repository:
 scripts/kext-s2-preflight.sh --private-policy-out "$HOME/private/bputil.json"
+# Check only the arguments (including the private path) and exit:
+scripts/kext-s2-preflight.sh --validate-only --private-policy-out "$HOME/private/bputil.json"
 ```
 
 The script:
 
-- checks the host build, Xcode/SDK, and that a KDK matching the host build
-  exists (exactly `KDK_<version>_<build>.kdk`);
-- runs the strict source check and the 22-test harness under ASan+UBSan and TSan;
-- builds the kext twice from a clean build tree and compares the executable
-  hashes;
-- checks the two-file bundle, `Info.plist`, arm64e, signing state and
-  `kmutil print-diagnostics -z --kdk <matching-kdk>` dependency resolution;
-- records the public `csrutil status` line and verifies `usbgadget` is not
-  loaded and `/Library/Extensions/usbgadget.kext` is absent;
+- validates `--private-policy-out` first, before any work: the path must be
+  absolute and name a file; its parent directory is resolved with `cd -P` and
+  compared by inode (`-ef`) with the repository root and every ancestor
+  directory, so `..`, `//`, symlinked directories, symlinked files and
+  case variants that resolve into the repository are rejected (exit 2);
+- checks the host build and Xcode/SDK;
+- validates the KDK for the host build, by content rather than by name
+  (`kext-provenance.py kdk-check`): `KDK_<version>_<build>.kdk` must exist,
+  its `System/Library/CoreServices/SystemVersion.plist` `ProductVersion` and
+  `ProductBuildVersion` must equal `sw_vers`, `System/Library/Kernels/kernel`
+  must be a Mach-O file, at least one arm64 `kernel.release.*` Mach-O kernel
+  and `System/Library/Extensions` must exist;
+- runs the strict source check and the mock harness under ASan+UBSan and
+  TSan;
+- builds the kext in the tree, then runs
+  `kext-provenance.py verify` against `build/kext/provenance.json`
+  (see `kext-provenance.md`): it **fails on a dirty tree** (uncommitted or
+  untracked changes under the kext source directory or `build-kext.sh`) and on
+  any mismatch of artifact, source digest or build script, and it prints the
+  commit, dirty flag, source digest, executable hash and the recorded
+  Xcode/SDK;
+- exports the build inputs of the working tree into a fresh git repository at
+  another path (`build/kext-s2-preflight/path-check/independent copy/mac2jb
+  checkout`, which contains a space), builds there, and requires the same
+  executable SHA-256 and the same source digest as the in-tree build;
+- checks the two-file bundle, `Info.plist`, arm64e and signing state, and runs
+  `kmutil print-diagnostics -p <bundle> -z` as a bundle-linkage diagnostic: it
+  reports that the declared kext dependencies resolve on this system. It is
+  not KDK evidence: the result is identical with no `--kdk`, with an empty
+  directory named like a KDK and with a KDK of another release, so it is not
+  passed a KDK and is not used to judge one;
+- records the public `csrutil status` line (information only) and verifies
+  `usbgadget` is not loaded and `/Library/Extensions/usbgadget.kext` is absent;
 - optionally captures `sudo bputil -d -j` to a private path outside the
   repository, without printing it;
 - prints the rollback commands and verifies they are documented.
@@ -43,25 +72,34 @@ The script:
 `kextutil -tn` is not usable on this host: `kextutil` is a kmutil front end and
 rejects `-n`. Use `kmutil print-diagnostics`.
 
-## Result (2026-11-02)
+## Result
+
+Run of 2026-11-03 against the working tree after the provenance rework (the
+tree was dirty: `usbgadget_userclient.cpp` and `build-kext.sh` carried
+uncommitted edits):
 
 | Check | Result |
 |---|---|
 | Host | macOS 27.0 (26A428), arm64 |
-| Xcode / SDK | Xcode 27.2 / macOS SDK 27.2 |
-| Matching KDK | pass: `KDK_27.0_26A428.kdk` present (26.0 also installed) |
-| S1 source gate | pass |
-| S1 harness | pass (22 tests, ASan+UBSan and TSan) |
-| Reproducible build | pass: two clean builds, 114360 bytes, SHA-256 `644fda29022f7152ab11c029b4bf342160180af364ce8748ad965a0bd0626fd0` |
+| Xcode / SDK | Xcode 27.2 (27B52) / macOS SDK 27.2 (26B118) |
+| KDK content | pass: `KDK_27.0_26A428.kdk`, SystemVersion 27.0 / 26A428, 14 arm64 release kernels |
+| S1 source gate / harness | pass |
+| Path-independent build | pass: the in-tree build and the build from a copy at another path (with a space) have the same executable SHA-256 `de79702967e272694568d6545f4e131bfcf0b21509c1cc3aab8c4c4c572674c5` (109296 bytes) and the same source digest |
+| Provenance verify | **fail, as designed:** `dirty` and `record-dirty` (uncommitted build inputs); it passes only on a clean, committed tree |
 | Bundle | pass: two files, no symlinks, `Info.plist` lint, arm64e, unsigned as built |
-| Load diagnostics | dependencies OK with the matching KDK; user-owned and unsigned diagnostics are expected pre-install |
-| Current state | `usbgadget` not loaded; target install path absent; `Kext Signing: enabled` |
-| Private LocalPolicy | captured privately, mode `0600`, outside the repo; baseline has `smb2:false`, `sip0:0x1014`, Permissive Security |
+| Bundle linkage | pass (`kmutil print-diagnostics`; user-owned and unsigned diagnostics are expected pre-install) |
+| Current state | `usbgadget` not loaded; target install path absent; the `csrutil status` line printed `Kext Signing: disabled` (information only) |
+| Private LocalPolicy | captured earlier, mode `0600`, outside the repo (see above) |
 | Rollback | documented in `kext-hardening-plan.md`; not executed |
 | SIP / install / load | untouched |
 
-The report is written to `build/kext-s2-preflight/preflight.md`; the build and
-harness logs are next to it. These are local artifacts, not release inputs.
+A passing preflight therefore requires committing the kext source and
+`build-kext.sh` first; the executable hash is a function of the source digest
+and the toolchain, not of the commit or the checkout path.
+
+The report is written to `build/kext-s2-preflight/preflight.md`; the build,
+verify and harness logs are next to it. These are local artifacts, not release
+inputs.
 
 ## Next steps
 

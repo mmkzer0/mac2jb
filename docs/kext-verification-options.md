@@ -94,8 +94,10 @@ Sources:
 - **KASAN/ASan in the real kext.** Third-party arm64e kexts have no supported
   kernel sanitizer path. The research claim that KASAN is internal-only was
   labeled fact without a citation; we treat it as unverified and rely on the
-  user-space harness plus S3. A KDK development kernel is a possible S3
-  diagnostic but needs a matching KDK and boot policy.
+  user-space harness plus S3. The installed matching `KDK_27.0_26A428.kdk`
+  ships development and KASAN kernels (including `vmapple`); booting one is a
+  possible S3 diagnostic that needs its own boot policy and does not
+  instrument this kext.
 - **KLEE now.** Mock-only and high effort; the harness already has symbolic-free
   fault sweeps. Revisit only if a specific parser/hostile-input surface appears.
 - **SPIN/Promela in addition to TLA+.** Same class of result; one model is
@@ -117,16 +119,19 @@ Sources:
 - The formal report's TLA+ and CBMC artifacts are sketches, not runnable tests;
   its "Infer P0, 2-4 hours" estimate ignores the C++ compile database problem;
   its KASAN claim lacked a citation; the KDK development-kernel estimate is
-  optimistic given no matching KDK is installed. The methodological ranking
-  (TLA+ first, CBMC conditional, Frama-C/seL4 rejected) survives review.
+  optimistic because booting a KDK kernel needs its own boot policy. The
+  methodological ranking (TLA+ first, CBMC conditional, Frama-C/seL4 rejected)
+  survives review.
 
 ## Verification status
 
-- Harness: 22 tests, pass under ASan+UBSan and TSan (~7.1 s); 30 ASan+UBSan
-  and 10 TSan full-suite stress loops passed.
-- Strict source gate: pass.
-- Final artifact: 114360 bytes, SHA-256
-  `644fda29022f7152ab11c029b4bf342160180af364ce8748ad965a0bd0626fd0`.
+- Harness: 23 tests, pass under ASan+UBSan and TSan (about 7 s) for four
+  seeds; the shim's `thread_deallocate` no longer joins the worker, and
+  post-signal and missing-`terminate()` mutants fail.
+- Strict source gate: pass; analyzer findings are errors.
+- Final artifact: 109296 bytes, SHA-256
+  `de79702967e272694568d6545f4e131bfcf0b21509c1cc3aab8c4c4c572674c5`, the
+  same from two checkout paths.
 - S2 preflight: pass with `KDK_27.0_26A428.kdk`; private LocalPolicy captured
   privately. Selected target is Permissive + kexts (`smb1:true`, `smb2:true`,
   `sip0=0x1005` with research guests); no SIP change, install or load yet.

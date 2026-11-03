@@ -2,7 +2,14 @@
 """mac2jb kext provenance and comparison tool.
 
 Subcommands:
-  record: records toolchain, host, git, source tree, and kext artifact provenance.
+  record: written by scripts/build-kext.sh right after a build; binds the
+    artifact to the digest of the compiled source copy, the toolchain actually
+    used, the build script and the matching KDK.
+  verify: fails when the artifact, the git-tracked source digest or the build
+    script no longer match the record, or when the build inputs are dirty.
+  kdk-check: validates the contents of the KDK matching a host version/build.
+  export-checkout: copies the build inputs of the working tree into a fresh git
+    repository at another path (path-independence checks).
   report: prints deterministic Markdown comparing a built kext against shipped.
 """
 
@@ -168,56 +175,69 @@ def find_bundle_components(bundle_path: Path) -> tuple[Path, Path, str, str]:
     return info_plist_path, exec_path, bundle_id, exec_name
 
 
+class ProvenanceError(Exception):
+    """A provenance input is missing, inconsistent, or unreadable."""
+
+
+SOURCE_REL = "vendor/macos_usb_gadget_poc/usbgadget"
+BUILD_SCRIPT_REL = "scripts/build-kext.sh"
+# Paths whose working-tree state decides whether a build is "dirty": the kext
+# source and the script that fixes every compiler and linker flag.
+BUILD_INPUTS = [SOURCE_REL, BUILD_SCRIPT_REL]
+EXPORT_INPUTS = BUILD_INPUTS + ["scripts/kext-provenance.py", ".gitignore"]
+RECORD_FORMAT = "mac2jb-kext-provenance-v2"
+DEFAULT_RECORD = "build/kext/provenance.json"
+DEFAULT_ARTIFACT = "build/kext/usbgadget.kext"
+DEFAULT_KDK_ROOT = "/Library/Developer/KDKs"
+BUILD_SETTING_KEYS = (
+    "DEVELOPER_DIR",
+    "MACOSX_DEPLOYMENT_TARGET",
+    "PLATFORM_PRODUCT_BUILD_VERSION",
+    "SDKROOT",
+    "SDK_NAME",
+    "SDK_PRODUCT_BUILD_VERSION",
+    "SDK_VERSION",
+    "SDK_VERSION_ACTUAL",
+    "XCODE_PRODUCT_BUILD_VERSION",
+    "XCODE_VERSION_ACTUAL",
+)
+
+
+def git_output(repo_root: Path, args: list) -> bytes:
+    """Run git in repo_root and return stdout; raise ProvenanceError on failure."""
+    res = subprocess.run(["git"] + args, cwd=str(repo_root), capture_output=True)
+    if res.returncode != 0:
+        detail = res.stderr.decode("utf-8", "replace").strip()
+        raise ProvenanceError(f"git {' '.join(args)} failed: {detail}")
+    return res.stdout
+
+
+def sha256_file(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
 def collect_git_info(repo_root: Path) -> dict:
-    """Collect git commit, branch, and dirty status ignoring build/."""
-    try:
-        res_commit = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            cwd=repo_root,
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        commit = res_commit.stdout.strip()
+    """Collect commit, branch, and dirty state of the build inputs only.
 
-        res_branch = subprocess.run(
-            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
-            cwd=repo_root,
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        branch = res_branch.stdout.strip()
-
-        res_status = subprocess.run(
-            ["git", "status", "--porcelain"],
-            cwd=repo_root,
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        dirty = False
-        for line in res_status.stdout.splitlines():
-            if not line:
-                continue
-            entry = line[3:].strip()
-            if entry.startswith('"') and entry.endswith('"'):
-                entry = entry[1:-1]
-            if " -> " in entry:
-                entry = entry.split(" -> ", 1)[1]
-            if entry == "build" or entry.startswith("build/"):
-                continue
-            dirty = True
-            break
-
-        return {
-            "branch": branch,
-            "commit": commit,
-            "dirty": dirty,
-        }
-    except Exception as err:
-        sys.stderr.write(f"error: failed to read git repository state: {err}\n")
-        sys.exit(1)
+    Dirty means: a tracked or untracked-but-not-ignored change under the kext
+    source directory or the build script. Ignored files never count.
+    """
+    commit = git_output(repo_root, ["rev-parse", "HEAD"]).decode().strip()
+    branch = git_output(repo_root, ["rev-parse", "--abbrev-ref", "HEAD"]).decode().strip()
+    status = git_output(
+        repo_root,
+        ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--"] + BUILD_INPUTS,
+    )
+    entries = [e for e in status.split(b"\0") if e]
+    dirty_paths = [
+        e[3:].decode("utf-8", "replace") for e in entries if len(e) > 3 and e[2:3] == b" "
+    ]
+    return {
+        "branch": branch,
+        "commit": commit,
+        "dirty": bool(entries),
+        "dirty_paths": dirty_paths[:20],
+    }
 
 
 def collect_host_info() -> dict:
@@ -248,8 +268,26 @@ def collect_host_info() -> dict:
         sys.exit(1)
 
 
-def collect_toolchain_info() -> dict:
-    """Collect toolchain version data."""
+def parse_build_settings(path: Path) -> dict:
+    """Extract the pinned keys from 'xcodebuild -showBuildSettings' output."""
+    settings = {}
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        key, sep, value = line.strip().partition(" = ")
+        if sep and key in BUILD_SETTING_KEYS:
+            settings[key] = strip_abs_paths(value.strip(), REPO_ROOT)
+    missing = [k for k in BUILD_SETTING_KEYS if k not in settings]
+    if missing:
+        raise ProvenanceError(f"build settings are missing {', '.join(missing)}: {path}")
+    return settings
+
+
+def collect_toolchain_info(build_settings_path: Optional[Path]) -> dict:
+    """Collect the toolchain the build actually used.
+
+    The caller runs this under the same sanitized environment as xcodebuild,
+    so xcodebuild/xcrun resolve the same Xcode. When a showBuildSettings dump is
+    supplied its pinned keys (SDK, Xcode build) are recorded verbatim.
+    """
     try:
         res_xcode = subprocess.run(
             ["xcodebuild", "-version"],
@@ -265,27 +303,17 @@ def collect_toolchain_info() -> dict:
                 xcode_ver = line.removeprefix("Xcode").strip()
             elif line.startswith("Build version"):
                 xcode_build = line.removeprefix("Build version").strip()
-            elif not xcode_ver:
-                xcode_ver = line
-            elif not xcode_build:
-                xcode_build = line
 
-        res_sdk_ver = subprocess.run(
-            ["xcrun", "--sdk", "macosx", "--show-sdk-version"],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        sdk_version = res_sdk_ver.stdout.strip()
+        def xcrun(flag: str) -> str:
+            res = subprocess.run(
+                ["xcrun", "--sdk", "macosx", flag],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            return res.stdout.strip()
 
-        res_sdk_path = subprocess.run(
-            ["xcrun", "--sdk", "macosx", "--show-sdk-path"],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        sdk_path = res_sdk_path.stdout.strip()
-        sdk_name = Path(sdk_path).name
+        sdk_path = xcrun("--show-sdk-path")
 
         res_clang = subprocess.run(
             ["xcrun", "clang", "--version"],
@@ -294,57 +322,158 @@ def collect_toolchain_info() -> dict:
             check=True,
         )
         clang_lines = [l.strip() for l in res_clang.stdout.splitlines() if l.strip()]
-        clang_version = clang_lines[0] if clang_lines else ""
 
-        return {
-            "clang": clang_version,
+        info = {
+            "clang": clang_lines[0] if clang_lines else "",
+            "developer_dir_override": os.environ.get("DEVELOPER_DIR"),
             "sdk": {
-                "name": sdk_name,
-                "path": sdk_path,
-                "version": sdk_version,
+                "build": xcrun("--show-sdk-build-version"),
+                "name": Path(sdk_path).name,
+                "path": strip_abs_paths(sdk_path, REPO_ROOT),
+                "version": xcrun("--show-sdk-version"),
             },
             "xcode": xcode_ver,
             "xcode_build": xcode_build,
         }
+        if build_settings_path is not None:
+            info["build_settings"] = parse_build_settings(build_settings_path)
+        return info
+    except ProvenanceError:
+        raise
     except Exception as err:
-        sys.stderr.write(f"error: failed to collect toolchain info: {err}\n")
-        sys.exit(1)
+        raise ProvenanceError(f"failed to collect toolchain info: {err}")
+
+
+def macho_header(path: Path) -> tuple:
+    """Return (magic, cputype) of a thin 64-bit Mach-O, or the raw magic for others."""
+    with open(path, "rb") as handle:
+        head = handle.read(8)
+    if len(head) < 8:
+        return (b"", 0)
+    return (head[:4], int.from_bytes(head[4:8], "little"))
+
+
+def inspect_kdk(kdk_path: Path, version: str, build: str) -> tuple:
+    """Validate KDK contents against a host version/build; return (info, problems)."""
+    problems = []
+    info = {"name": kdk_path.name, "path": str(kdk_path)}
+    if not kdk_path.is_dir():
+        return info, [f"KDK directory is missing: {kdk_path}"]
+
+    plist_path = kdk_path / "System" / "Library" / "CoreServices" / "SystemVersion.plist"
+    if not plist_path.is_file():
+        problems.append("KDK has no System/Library/CoreServices/SystemVersion.plist")
+    else:
+        try:
+            data = plistlib.loads(plist_path.read_bytes())
+        except Exception as err:
+            data = {}
+            problems.append(f"KDK SystemVersion.plist is unreadable: {err}")
+        info["product_version"] = data.get("ProductVersion")
+        info["product_build"] = data.get("ProductBuildVersion")
+        info["system_version_sha256"] = sha256_file(plist_path)
+        if data.get("ProductVersion") != version:
+            problems.append(
+                f"KDK ProductVersion is {data.get('ProductVersion')!r}, host is {version!r}"
+            )
+        if data.get("ProductBuildVersion") != build:
+            problems.append(
+                f"KDK ProductBuildVersion is {data.get('ProductBuildVersion')!r}, host is {build!r}"
+            )
+
+    kernels = kdk_path / "System" / "Library" / "Kernels"
+    kernel = kernels / "kernel"
+    if not kernel.is_file() or kernel.stat().st_size == 0:
+        problems.append("KDK has no System/Library/Kernels/kernel")
+    elif macho_header(kernel)[0] not in (b"\xcf\xfa\xed\xfe", b"\xca\xfe\xba\xbe"):
+        problems.append("KDK System/Library/Kernels/kernel is not a Mach-O file")
+
+    arm_kernels = []
+    if kernels.is_dir():
+        for candidate in sorted(kernels.glob("kernel.release.*")):
+            if candidate.is_file():
+                magic, cputype = macho_header(candidate)
+                if magic == b"\xcf\xfa\xed\xfe" and cputype == 0x0100000C:
+                    arm_kernels.append(candidate.name)
+    info["arm64_release_kernels"] = arm_kernels
+    if not arm_kernels:
+        problems.append("KDK has no arm64 System/Library/Kernels/kernel.release.* Mach-O kernel")
+
+    if not (kdk_path / "System" / "Library" / "Extensions").is_dir():
+        problems.append("KDK has no System/Library/Extensions")
+    return info, problems
+
+
+def collect_kdk_info(host: dict, kdk_root: Path) -> dict:
+    """Record the KDK matching the host build; absence is recorded, not fatal."""
+    name = f"KDK_{host['version']}_{host['build']}.kdk"
+    info, problems = inspect_kdk(kdk_root / name, host["version"], host["build"])
+    info["problems"] = problems
+    info["valid"] = not problems
+    return info
+
+
+def file_digests(paths: list, base: Path) -> list:
+    files = []
+    for rel in sorted(paths):
+        content = (base / rel).read_bytes()
+        files.append({
+            "path": rel,
+            "sha256": hashlib.sha256(content).hexdigest(),
+            "size": len(content),
+        })
+    return files
+
+
+def tree_digest(files: list) -> str:
+    # sha256 over the UTF-8 text of sorted lines '<relative path>\0<sha256>\n'
+    tree_text = "".join(f"{f['path']}\0{f['sha256']}\n" for f in files)
+    return hashlib.sha256(tree_text.encode("utf-8")).hexdigest()
 
 
 def collect_source_info(source_dir: Path, repo_root: Path) -> dict:
-    """Collect source files and compute tree_sha256."""
+    """Digest the git-tracked files of source_dir as they are in the working tree.
+
+    Ignored and untracked files (.DS_Store, xcuserdata, scratch files) are not
+    part of the digest; untracked-but-not-ignored files make the tree dirty
+    instead (see collect_git_info).
+    """
     source_dir = source_dir.resolve()
-    if not source_dir.is_dir():
-        sys.stderr.write(f"error: source directory not found: {source_dir}\n")
-        sys.exit(1)
-
-    source_rel_path = to_repo_rel(source_dir, repo_root)
-
-    files = []
-    for root, _, filenames in os.walk(source_dir):
-        for name in filenames:
-            f = Path(root) / name
-            if not f.is_file():
-                continue
-            rel_path = str(f.relative_to(source_dir).as_posix())
-            content = f.read_bytes()
-            files.append({
-                "path": rel_path,
-                "sha256": hashlib.sha256(content).hexdigest(),
-                "size": len(content),
-            })
-
-    files.sort(key=lambda x: x["path"])
-
-    # tree_sha256 = sha256 over the UTF-8 text of sorted lines '<relative path>\0<sha256>\n'
-    tree_text = "".join(f"{f['path']}\0{f['sha256']}\n" for f in files)
-    tree_sha256 = hashlib.sha256(tree_text.encode("utf-8")).hexdigest()
-
+    try:
+        source_rel = source_dir.relative_to(repo_root).as_posix()
+    except ValueError:
+        raise ProvenanceError(f"source directory is outside the repository: {source_dir}")
+    listing = git_output(repo_root, ["ls-files", "-z", "--", source_rel])
+    names = [n.decode("utf-8") for n in listing.split(b"\0") if n]
+    if not names:
+        raise ProvenanceError(f"no tracked files under {source_rel}")
+    prefix = source_rel + "/"
+    rels = []
+    for name in names:
+        if not (repo_root / name).is_file():
+            raise ProvenanceError(f"tracked source file is missing or not a file: {name}")
+        rels.append(name[len(prefix):])
+    files = file_digests(rels, source_dir)
     return {
         "files": files,
-        "path": source_rel_path,
-        "tree_sha256": tree_sha256,
+        "path": source_rel,
+        "tree_sha256": tree_digest(files),
     }
+
+
+def collect_dir_info(directory: Path) -> dict:
+    """Digest every regular file under directory with the same scheme."""
+    directory = directory.resolve()
+    if not directory.is_dir():
+        raise ProvenanceError(f"directory not found: {directory}")
+    rels = []
+    for root, _, filenames in os.walk(directory):
+        for name in filenames:
+            f = Path(root) / name
+            if f.is_file():
+                rels.append(f.relative_to(directory).as_posix())
+    files = file_digests(rels, directory)
+    return {"files": files, "tree_sha256": tree_digest(files)}
 
 
 def collect_artifact_info(bundle_path: Path, repo_root: Path) -> dict:
@@ -353,8 +482,7 @@ def collect_artifact_info(bundle_path: Path, repo_root: Path) -> dict:
     info_plist_path, exec_path, bundle_id, _ = find_bundle_components(bundle_path)
 
     artifact_rel_path = to_repo_rel(bundle_path, repo_root)
-    info_plist_bytes = info_plist_path.read_bytes()
-    info_plist_sha256 = hashlib.sha256(info_plist_bytes).hexdigest()
+    info_plist_sha256 = sha256_file(info_plist_path)
 
     exec_bytes = exec_path.read_bytes()
     exec_sha256 = hashlib.sha256(exec_bytes).hexdigest()
@@ -362,20 +490,13 @@ def collect_artifact_info(bundle_path: Path, repo_root: Path) -> dict:
     exec_rel_path = str(exec_path.relative_to(bundle_path).as_posix())
     exec_arch = get_executable_arch(exec_path)
 
-    files = []
+    rels = []
     for root, _, filenames in os.walk(bundle_path):
         for name in filenames:
             f = Path(root) / name
-            if not f.is_file():
-                continue
-            rel_file = str(f.relative_to(bundle_path).as_posix())
-            content = f.read_bytes()
-            files.append({
-                "path": rel_file,
-                "sha256": hashlib.sha256(content).hexdigest(),
-                "size": len(content),
-            })
-    files.sort(key=lambda x: x["path"])
+            if f.is_file():
+                rels.append(f.relative_to(bundle_path).as_posix())
+    files = file_digests(rels, bundle_path)
 
     codesign_state = get_codesign_state(bundle_path, repo_root)
 
@@ -395,39 +516,191 @@ def collect_artifact_info(bundle_path: Path, repo_root: Path) -> dict:
 
 
 def cmd_record(args: argparse.Namespace) -> None:
-    """Execute record subcommand."""
+    """Record provenance for a build that was just produced from build/kext/src.
+
+    The record binds the artifact to the digest of the compiled source copy. It
+    refuses to be written when the working-tree source no longer equals that
+    copy, so an edit made after the build cannot yield a record.
+    """
     ensure_tools(["git", "sw_vers", "xcodebuild", "xcrun", "codesign"])
 
-    artifact_path = Path(args.artifact)
-    source_path = Path(args.source)
     output_path = Path(args.output).resolve()
+    script_path = Path(args.build_script).resolve()
 
     git_info = collect_git_info(REPO_ROOT)
     host_info = collect_host_info()
-    toolchain_info = collect_toolchain_info()
-    source_info = collect_source_info(source_path, REPO_ROOT)
-    artifact_info = collect_artifact_info(artifact_path, REPO_ROOT)
+    toolchain_info = collect_toolchain_info(Path(args.build_settings))
+    kdk_info = collect_kdk_info(host_info, Path(args.kdk_root))
+    source_info = collect_source_info(Path(args.source), REPO_ROOT)
+    built_info = collect_dir_info(Path(args.built_source))
+    if built_info["tree_sha256"] != source_info["tree_sha256"]:
+        raise ProvenanceError(
+            "the source tree no longer matches the copy that was compiled "
+            f"(working tree {source_info['tree_sha256']}, compiled {built_info['tree_sha256']})"
+        )
+    artifact_info = collect_artifact_info(Path(args.artifact), REPO_ROOT)
 
     created_iso = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     record_data = {
         "artifact": artifact_info,
+        "build": {
+            "arguments": list(args.build_arg),
+            "script": to_repo_rel(script_path, REPO_ROOT),
+            "script_sha256": sha256_file(script_path),
+        },
         "created": created_iso,
-        "format": "mac2jb-kext-provenance-v1",
+        "format": RECORD_FORMAT,
         "git": git_info,
         "host": host_info,
+        "kdk": kdk_info,
         "source": source_info,
         "toolchain": toolchain_info,
     }
 
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(record_data, f, indent=2, sort_keys=True)
+        f.write("\n")
+
+
+def cmd_verify(args: argparse.Namespace) -> None:
+    """Fail unless the artifact, source and build script still match the record.
+
+    Problem codes (one 'problem: <code>: <detail>' line each):
+      record, record-dirty, dirty, artifact-files, artifact-hash,
+      source-digest, build-script.
+    """
+    ensure_tools(["git", "codesign"])
+    problems = []
+    notes = []
+
+    def problem(code: str, detail: str, dirty_class: bool = False) -> None:
+        if dirty_class and args.allow_dirty:
+            notes.append(f"note: {code}: {detail}")
+        else:
+            problems.append(f"problem: {code}: {detail}")
+
+    record = None
     try:
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(output_path, "w", encoding="utf-8") as f:
-            json.dump(record_data, f, indent=2, sort_keys=True)
-            f.write("\n")
-    except Exception as err:
-        sys.stderr.write(f"error: failed to write output file: {err}\n")
+        record = json.loads(Path(args.record).read_text(encoding="utf-8"))
+        if record.get("format") != RECORD_FORMAT:
+            problem("record", f"unexpected record format {record.get('format')!r}")
+            record = None
+    except (OSError, ValueError) as err:
+        problem("record", f"cannot read {args.record}: {err}")
+
+    commit = dirty = source_sha = exec_sha = "unknown"
+    try:
+        git_info = collect_git_info(REPO_ROOT)
+        commit = git_info["commit"]
+        dirty = "true" if git_info["dirty"] else "false"
+        if git_info["dirty"]:
+            problem("dirty", "build inputs have uncommitted changes: "
+                    + ", ".join(git_info["dirty_paths"]), True)
+    except ProvenanceError as err:
+        problem("dirty", f"cannot determine git state: {err}")
+
+    current_source = None
+    try:
+        current_source = collect_source_info(Path(args.source), REPO_ROOT)
+        source_sha = current_source["tree_sha256"]
+    except ProvenanceError as err:
+        problem("source-digest", str(err))
+
+    current_artifact = None
+    try:
+        current_artifact = collect_artifact_info(Path(args.artifact), REPO_ROOT)
+        exec_sha = current_artifact["executable"]["sha256"]
+    except (ProvenanceError, SystemExit):
+        problem("artifact-files", f"cannot read the artifact bundle: {args.artifact}")
+
+    if record is not None:
+        if record["git"]["dirty"]:
+            problem("record-dirty",
+                    "the artifact was built from a dirty tree: "
+                    + ", ".join(record["git"].get("dirty_paths", [])), True)
+        if current_source is not None and current_source["tree_sha256"] != record["source"]["tree_sha256"]:
+            problem("source-digest",
+                    f"source tree is {current_source['tree_sha256']}, record has "
+                    f"{record['source']['tree_sha256']}")
+        script = Path(args.build_script)
+        if not script.is_file() or sha256_file(script) != record["build"]["script_sha256"]:
+            problem("build-script", f"{BUILD_SCRIPT_REL} differs from the script that built the artifact")
+        if current_artifact is not None:
+            if current_artifact["executable"]["sha256"] != record["artifact"]["executable"]["sha256"]:
+                problem("artifact-hash",
+                        f"executable is {current_artifact['executable']['sha256']}, record has "
+                        f"{record['artifact']['executable']['sha256']}")
+            now = {f["path"]: f["sha256"] for f in current_artifact["files"]}
+            then = {f["path"]: f["sha256"] for f in record["artifact"]["files"]}
+            if now != then:
+                changed = sorted(p for p in set(now) | set(then) if now.get(p) != then.get(p))
+                problem("artifact-files", "bundle files differ from the record: " + ", ".join(changed))
+
+    print(f"provenance: commit={commit} dirty={dirty} source_sha256={source_sha} "
+          f"executable_sha256={exec_sha}")
+    for line in notes + problems:
+        print(line)
+    sys.exit(1 if problems else 0)
+
+
+def cmd_kdk_check(args: argparse.Namespace) -> None:
+    """Validate the KDK matching a host version/build under --kdk-root."""
+    version = args.product_version
+    build = args.product_build
+    if not version or not build:
+        host = collect_host_info()
+        version = version or host["version"]
+        build = build or host["build"]
+    name = f"KDK_{version}_{build}.kdk"
+    info, problems = inspect_kdk(Path(args.kdk_root) / name, version, build)
+    if problems:
+        for line in problems:
+            print(f"problem: {line}")
         sys.exit(1)
+    print(f"kdk: {name} ProductVersion={info['product_version']} "
+          f"ProductBuildVersion={info['product_build']} "
+          f"arm64_release_kernels={len(info['arm64_release_kernels'])}")
+
+
+def cmd_export_checkout(args: argparse.Namespace) -> None:
+    """Copy the build inputs of the working tree into a fresh one-commit git repo.
+
+    The copy mirrors the working tree (including uncommitted edits) at another
+    path, so a build there shows path independence without touching this repo.
+    """
+    dest = Path(args.dest).resolve()
+    if dest.exists() and any(dest.iterdir()):
+        raise ProvenanceError(f"destination is not empty: {dest}")
+    listing = git_output(
+        REPO_ROOT,
+        ["ls-files", "-z", "--cached", "--others", "--exclude-standard", "--"] + EXPORT_INPUTS,
+    )
+    for raw in listing.split(b"\0"):
+        if not raw:
+            continue
+        name = raw.decode("utf-8")
+        src = REPO_ROOT / name
+        if not src.is_file():
+            continue
+        target = dest / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, target)
+
+    env = dict(os.environ, GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_NOSYSTEM="1")
+    identity = ["-c", "user.name=kext-export", "-c", "user.email=kext-export@localhost",
+                "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null"]
+    for git_args in (
+        ["-c", "init.defaultBranch=main", "init", "-q"],
+        ["add", "-A"],
+        identity + ["commit", "-q", "--no-verify", "-m", "Export kext build inputs"],
+    ):
+        res = subprocess.run(["git"] + git_args, cwd=str(dest), env=env,
+                             capture_output=True, text=True)
+        if res.returncode != 0:
+            raise ProvenanceError(f"git {git_args[-1]} failed in {dest}: {res.stderr.strip()}")
+    print(str(dest))
 
 
 def parse_otool_sections(output: str) -> dict[tuple[str, str], int]:
@@ -802,23 +1075,54 @@ def main() -> None:
 
     record_parser = subparsers.add_parser(
         "record",
-        help="Record provenance metadata for a built kext",
+        help="Record provenance for a kext just built by scripts/build-kext.sh",
+    )
+    record_parser.add_argument("--artifact", required=True, help="Path to built kext bundle")
+    record_parser.add_argument("--source", required=True, help="Path to kext source directory")
+    record_parser.add_argument(
+        "--built-source", required=True,
+        help="Copy of the source tree that was compiled (must digest equal to --source)",
+    )
+    record_parser.add_argument("--build-script", required=True, help="Path to the build script")
+    record_parser.add_argument(
+        "--build-settings", required=True,
+        help="Output of xcodebuild -showBuildSettings for the build",
     )
     record_parser.add_argument(
-        "--artifact",
-        required=True,
-        help="Path to built kext bundle",
+        "--build-arg", action="append", default=[],
+        help="Non-path xcodebuild argument to record (repeatable)",
     )
     record_parser.add_argument(
-        "--source",
-        required=True,
-        help="Path to kext source directory",
+        "--kdk-root", default=DEFAULT_KDK_ROOT, help="Directory holding KDK_*.kdk"
     )
-    record_parser.add_argument(
-        "--output",
-        required=True,
-        help="Path to output JSON file",
+    record_parser.add_argument("--output", required=True, help="Path to output JSON file")
+
+    verify_parser = subparsers.add_parser(
+        "verify",
+        help="Fail unless artifact, source digest and build script match the record",
     )
+    verify_parser.add_argument("--record", default=str(REPO_ROOT / DEFAULT_RECORD))
+    verify_parser.add_argument("--artifact", default=str(REPO_ROOT / DEFAULT_ARTIFACT))
+    verify_parser.add_argument("--source", default=str(REPO_ROOT / SOURCE_REL))
+    verify_parser.add_argument("--build-script", default=str(REPO_ROOT / BUILD_SCRIPT_REL))
+    verify_parser.add_argument(
+        "--allow-dirty", action="store_true",
+        help="Report a dirty tree as a note instead of a failure (iteration builds)",
+    )
+
+    kdk_parser = subparsers.add_parser(
+        "kdk-check",
+        help="Validate the KDK matching the host (or given) macOS version/build",
+    )
+    kdk_parser.add_argument("--kdk-root", default=DEFAULT_KDK_ROOT)
+    kdk_parser.add_argument("--product-version", default="")
+    kdk_parser.add_argument("--product-build", default="")
+
+    export_parser = subparsers.add_parser(
+        "export-checkout",
+        help="Copy the build inputs into a fresh git repository at --dest",
+    )
+    export_parser.add_argument("--dest", required=True)
 
     report_parser = subparsers.add_parser(
         "report",
@@ -841,12 +1145,17 @@ def main() -> None:
     )
 
     args = parser.parse_args()
-    if args.subcommand == "record":
-        cmd_record(args)
-    elif args.subcommand == "report":
-        cmd_report(args)
-    else:
-        parser.print_help(sys.stderr)
+    handlers = {
+        "record": cmd_record,
+        "verify": cmd_verify,
+        "kdk-check": cmd_kdk_check,
+        "export-checkout": cmd_export_checkout,
+        "report": cmd_report,
+    }
+    try:
+        handlers[args.subcommand](args)
+    except ProvenanceError as err:
+        sys.stderr.write(f"error: {err}\n")
         sys.exit(1)
 
 

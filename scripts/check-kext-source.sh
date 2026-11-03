@@ -46,7 +46,7 @@ for file in usbgadget.cpp usbgadget_userclient.cpp; do
   fi
 
   echo "checking $file"
-  if ! clang --analyze "${COMMON[@]}" "${WARNINGS[@]}" -Xanalyzer -analyzer-output=text "$SOURCE/$file"; then
+  if ! clang --analyze -Xclang -analyzer-werror "${COMMON[@]}" "${WARNINGS[@]}" -Xanalyzer -analyzer-output=text "$SOURCE/$file"; then
     fail "kext source check failed"
   fi
 done

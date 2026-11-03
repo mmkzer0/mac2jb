@@ -32,6 +32,8 @@ IOKit boundary in user space and cannot replace the S3 hardware gate.
 | F14 | `usbgadget.cpp` `doUpdate` | Medium | The provider callback ran under `m_pokeLock`; a synchronous reentrant callback would self-deadlock, and a slow callback serialized pokes | fixed: retain configuration/provider snapshots, drop the lock for the callback, and clear the pending flag only when the poke serial is unchanged; test 7b |
 | F15 | `usbgadget.cpp` `setProperties` | Medium | Unknown keys were ignored, `Poke` accepted any value type, and a failed `setProperty` was reported as success after the configuration had already changed | fixed: validate the entire dictionary, require the host's `OSString` Poke value, publish before committing, and leave state unchanged on failure; test 1 |
 | F16 | `usbgadget.cpp` `setProperties` | Medium | Two concurrent `PublishConfiguration` calls could interleave between the registry write and the private commit, leaving the registry with B and the worker's `m_configuration` with A | fixed: a dedicated `m_configLock` serializes the registry write with the private commit (`m_pokeLock` protects the swap); a second publish waits; test 7c |
+| F17 | `usbgadget_userclient.cpp` `clientClose` | Medium | `clientClose` released the provider but never called `terminate()`. `IOService::newUserClient` attaches the client to the gadget and IOKit does not detach it on close, so each local open/close left one attached client (object, lock, registry entry) until the gadget terminated | fixed: `clientClose` calls `terminate()`; IOKit then runs `stop` and `detach`; test 6f |
+| F18 | `tests/kext/shim` `thread_deallocate` | Medium | The shim joined the worker inside `thread_deallocate`, which XNU does not do, so the worker-after-teardown checks could never fire: a worker that touched the gadget after signalling `m_threadDone` passed all 22 tests under ASan | fixed: `thread_deallocate` only drops the owner's reference; a worker that woke a sleeper stalls after its unlock until its owner releases it, and any later shim call or member access is reported (shim violation or ASan use-after-free); threads are joined by `reap_released_threads` |
 
 ## Teardown protocol after the fix
 
@@ -63,7 +65,8 @@ IOKit boundary in user space and cannot replace the S3 hardware gate.
   free `m_configLock` and `m_pokeLock` once each, null them.
 - User client: members initialized before any early return; provider retained
   in `start` under `m_providerLock`; `stop` and `clientClose` both call the
-  idempotent `releaseProvider`; `methodPoke` takes a retained copy under the
+  idempotent `releaseProvider`; `clientClose` then calls `terminate()` so IOKit
+  stops and detaches the client; `methodPoke` takes a retained copy under the
   lock and rejects with `kIOReturnNotReady` after close; `free` releases the
   provider and the lock exactly once.
 
@@ -81,45 +84,51 @@ this cannot be completed before the kext is loaded and is not a pre-load gate.
 
 - `scripts/check-kext-source.sh`: strict syntax pass (`-Wall -Wextra -Werror
   -Wconversion -Wshorten-64-to-32 -Wnull-dereference`) and `clang --analyze`
-  pass for both translation units.
+  pass for both translation units; analyzer findings are errors
+  (`-analyzer-werror`).
 - `scripts/build-kext.sh`: Release build, arm64e, exactly
-  `Contents/Info.plist` and `Contents/MacOS/usbgadget`, unsigned.
-  Current executable SHA-256 `644fda29022f7152ab11c029b4bf342160180af364ce8748ad965a0bd0626fd0`.
-- S2 preflight: `scripts/kext-s2-preflight.sh` builds twice (identical hash),
-  checks the matching KDK, bundle/dependency diagnostics, current load and
-  public SIP state, and rollback documentation. The 2026-11-02 run passes with
-  `KDK_27.0_26A428.kdk`; the private LocalPolicy snapshot is captured privately
-  and shows the pre-S2 Permissive baseline, no SIP change, install or load was
-  performed. See `docs/kext-s2-preflight.md`.
-- `nm -u`: no undefined symbol from this kext's own classes. The new kernel
-  imports (`IOLockSleep`, `IOLockWakeup`, `IORegistryEntry::setProperties`,
-  `OSString::metaClass`, `OSSymbol::metaClass`, `IOService::metaClass`) exist in
-  the installed KDK 26.0 kernel symbol table. S2 still requires the matching
-  macOS 27.0 KDK; the installed 26.0 KDK is not a substitute.
-- Mock harness: `scripts/test-kext-harness.sh` builds and runs 22 tests under
-  ASan+UBSan and again under TSan; all pass (7.05 s). Coverage: shim lock
+  `Contents/Info.plist` and `Contents/MacOS/usbgadget`, unsigned, without debug
+  information and under a scrubbed environment, so the executable hash depends
+  only on the tracked source and the toolchain. It writes
+  `build/kext/provenance.json`; `scripts/kext-provenance.py verify` rejects a
+  dirty tree or a source/artifact mismatch. Current executable SHA-256
+  `de79702967e272694568d6545f4e131bfcf0b21509c1cc3aab8c4c4c572674c5`
+  (Xcode 27.2 27B52, SDK 27.2 26B118).
+- S2 preflight: `scripts/kext-s2-preflight.sh` builds in the tree and again
+  from a copy at a different path (identical hash and source digest), verifies
+  provenance, validates the KDK contents, runs the source and harness gates,
+  bundle diagnostics, current load and public SIP state, and rollback
+  documentation. See `docs/kext-s2-preflight.md`.
+- `nm -u`: all 354 imports resolve against the arm64 KDK 27.0 (`26A428`)
+  release kernels (`kernel.release.vmapple`, `kernel.release.t8112`), including
+  the new `IOService::terminate`; none comes from this kext's own classes.
+- Mock harness: `scripts/test-kext-harness.sh` builds and runs 23 tests under
+  ASan+UBSan and again under TSan; all pass (about 7 s). Coverage: shim lock
   semantics; `setProperties` validation (unknown keys, Poke type, publish
   failure/no state change) and an allocation-failure sweep; fail-closed thread
   start failure; lifecycle permutations (start/stop/free, start/free, double
   stop, free without start/init, super failures); exactly-once teardown with
   100 stop/stopThread/poke races; user-client init/start/stop/clientClose/free
-  orderings, poke-vs-close (200 iterations), not-ready dispatch; stop waits for
-  an in-flight controller call while a poke completes; synchronous controller
-  reentrancy without deadlock or a lost update; serial-checked update completion
-  (the sweep's settled wait is race-free); two concurrent PublishConfiguration
-  writers with a test-only shim observer, proving the registry write and private
-  commit cannot interleave; general one-shot and sticky
-  fault sweeps over every tracked allocation, `IOLockAlloc`,
-  `kernel_thread_start` and provider `setProperties` for both teardown
-  variants; a 256-entry operation trace dumped on failure; worker-after-
-  teardown, lock-balance and freed-lock checks; seeded sleep/lock jitter.
-  Thirty ASan+UBSan and ten TSan full-suite stress loops passed after test 7c
-  was added. Limits: the shim models IOKit; it cannot model the real
-  `IOUSBDeviceController`, and the tests use `#define private public` to reach
-  internals. The two-writer observer exists only in `tests/kext/shim`, not in
-  the shipped kext. Test 7c fails on the pre-fix `5941f9a` source (the second
-  publish completes and the private copy retains `publish-A`) and passes after
-  F16.
+  orderings, poke-vs-close (200 iterations), not-ready dispatch; close
+  terminates and detaches an attached client, also after the gadget terminated
+  it first (6f); stop waits for an in-flight controller call while a poke
+  completes; synchronous controller reentrancy without deadlock or a lost
+  update; serial-checked update completion (the sweep's settled wait is
+  race-free); two concurrent PublishConfiguration writers with a test-only shim
+  observer, proving the registry write and private commit cannot interleave;
+  general one-shot and sticky fault sweeps over every tracked allocation,
+  `IOLockAlloc`, `kernel_thread_start` and provider `setProperties` for both
+  teardown variants; a 256-entry operation trace dumped on failure;
+  worker-after-release, lock-balance and freed-lock checks; seeded sleep/lock
+  jitter. The shim's `thread_deallocate` follows XNU and does not wait for the
+  worker (F18). Mutants that touch the gadget after the done signal (a shim call
+  with or without a delay, or a plain member write) and a `clientClose` without
+  `terminate()` all fail; four seeds pass the full suite. Limits: the shim
+  models IOKit; it cannot model the real `IOUSBDeviceController`, and the tests
+  use `#define private public` to reach internals. The two-writer observer
+  exists only in `tests/kext/shim`, not in the shipped kext. Test 7c fails on
+  the pre-fix `5941f9a` source (the second publish completes and the private
+  copy retains `publish-A`) and passes after F16.
 
 ## Research dispositions
 
@@ -158,9 +167,12 @@ Frama-C/TrustInSoft/seL4, and KASAN for third-party kexts.
   the private commit; the worker only reads the private copy under `m_pokeLock`,
   and no API promises a cross-observer atomic snapshot.
 - `clientClose` returns success without calling `super::clientClose` (the base
-  returns `kIOReturnUnsupported`; `clientDied` calls `clientClose`).
-- The worker continuation returns normally (no `thread_terminate`); this is the
-  pre-existing kernel-thread pattern.
+  returns `kIOReturnUnsupported`; `clientDied` calls `clientClose`). A second
+  `terminate()` after the gadget already terminated the client is a no-op.
+- The worker continuation returns normally (no `thread_terminate`), so it runs
+  its epilogue after `stopThread` returns. It touches no object state there
+  (the harness stall proves this), and on macOS 11 and later kext code stays
+  mapped until reboot, so returning into unloaded text is not reachable.
 - Kernel ABI, PAC signing, AuxKC policy and hardware timing are outside static
   verification; S3 is the gate.
 - The shipped binary corresponds to a Debug build of an older toolchain; our

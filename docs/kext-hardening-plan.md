@@ -220,7 +220,8 @@ Acceptance:
 - `bash scripts/build-kext.sh` succeeds from a clean checkout.
 - Artifact is arm64e and unsigned (or ad-hoc signed), and its file list is
   exactly `Contents/Info.plist` and `Contents/MacOS/usbgadget`.
-- `python3 scripts/kext-provenance.py record …` writes valid JSON;
+- `bash scripts/build-kext.sh` writes `build/kext/provenance.json`;
+  `python3 scripts/kext-provenance.py verify` passes on a clean tree and
   `… report …` produces `docs/kext-provenance.md` without absolute paths.
 - `scripts/audit-release.py` still passes with the untouched shipped binary.
 - `docs/kext-provenance.md` explains every difference to the shipped binary.

@@ -16,6 +16,7 @@
 #include <vector>
 
 class OSSymbol;
+class IOService;
 
 typedef uint32_t UInt32;
 typedef uint32_t IOOptionBits;
@@ -135,9 +136,17 @@ void trace_event(const char *op, long result);
 void dump_trace(FILE *out, unsigned count);
 
 // After the object under test has been stopped/freed, no kext-created worker thread may call into the shim.
-// mark_quiescent() also verifies that no worker is still running.
+// mark_quiescent() also verifies that every started worker was released with thread_deallocate.
 void mark_quiescent();
 void clear_quiescent();
+
+// thread_deallocate only drops the owner's reference, as in XNU: it never waits for the worker. This joins
+// every worker its owner has released, so a test can assert that no worker is still running.
+void reap_released_threads();
+
+// IOKit's termination thread for a service whose terminate() was requested: stop(provider), then
+// detach(provider). No-op for an active or unattached service.
+void complete_termination(IOService *service);
 
 // Prints a shim violation to stderr and counts it.
 void violation(const char *fmt, ...);
@@ -319,6 +328,14 @@ class IOService : public OSObject {
     virtual IOReturn setProperties(OSObject *properties);
     virtual void registerService(IOOptionBits options = 0);
 
+    // Registry attachment holds a reference on both entries until detach().
+    virtual bool attach(IOService *provider);
+    virtual void detach(IOService *provider);
+    // Marks the service inactive and returns true only for the first call. As in IOKit, stop() and
+    // detach() run later on the termination thread; kext_shim::complete_termination() models that step.
+    virtual bool terminate(IOOptionBits options = 0);
+    bool isInactive() const { return shim_inactive_.load(); }
+
     virtual bool setProperty(const OSSymbol *key, OSObject *value);
     bool setProperty(const char *key, OSObject *value);
     OSObject *getProperty(const OSSymbol *key) const;
@@ -328,9 +345,14 @@ class IOService : public OSObject {
     std::atomic<int> shim_start_calls;
     std::atomic<int> shim_stop_calls;
     std::atomic<int> shim_register_calls;
+    std::atomic<int> shim_terminate_calls;
 
   private:
+    friend void kext_shim::complete_termination(IOService *service);
+
     OSDictionary *properties_;
+    std::atomic<bool> shim_inactive_;
+    IOService *shim_provider_;  // set by attach(), cleared by detach()
 };
 
 struct IOExternalMethodArguments {

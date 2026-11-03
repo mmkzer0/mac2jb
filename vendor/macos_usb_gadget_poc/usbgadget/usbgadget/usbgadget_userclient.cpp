@@ -66,6 +66,10 @@ void gay_bowser_usbgadget_userclient::stop(IOService *provider) {
 IOReturn gay_bowser_usbgadget_userclient::clientClose(void) {
     LogD("Executing 'gay_bowser_usbgadget_userclient::clientClose()'.");
     releaseProvider();
+    // IOService::newUserClient attached this client to the gadget; IOKit never
+    // detaches it on close, so without terminate() every open/close leaks one
+    // attached client until the gadget itself terminates.
+    terminate();
     return kIOReturnSuccess;
 }
 
