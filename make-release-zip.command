@@ -14,6 +14,7 @@ for path in \
     sender.c \
     commands.c \
     keyboard.c \
+    civswitch-hid.c \
     indent-test.bas \
     upstream.lock \
     vendor/libusbd/Makefile \
@@ -55,6 +56,7 @@ for item in \
     sender.c \
     commands.c \
     keyboard.c \
+    civswitch-hid.c \
     mac2jb.command \
     setup.sh \
     fetch-bootstrap.sh \
