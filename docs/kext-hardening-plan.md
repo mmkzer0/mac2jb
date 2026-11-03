@@ -103,8 +103,10 @@ Post-S2 LocalPolicy (2026-11-03; same 42-field schema, full dump private):
 
 All three extra bits come from `csrutil --without kext` itself (mapping below):
 `0x1` and `0x8` are stored, and `sip2` is set. `0x10` is `csrutil`'s default and
-was already in the baseline. `csrutil status` does not display `sip2`, so S2
-verification must read `sip1..3` from the private `bputil` dump.
+was already in the baseline. `csrutil status` reports CTRR as `Kernel Integrity
+Protections` (observed `disabled` with `sip2:true` after S2), `sip3` as
+`Boot-arg Restrictions` and `sip1` as `Authenticated Root Requirement`; the
+private `bputil` dump stays the authoritative record of the raw fields.
 
 `csrutil` bit mapping (disassembly of `/usr/bin/csrutil`, macOS 27.0 `26A428`,
 SHA-256 `9757bba7656bd3111d5177314eb02faecede9f4ab4c2be08fbd913c9de4b3d7b`;
@@ -368,12 +370,12 @@ Steps, in this order:
 Verification after boot:
 
 - `csrutil status` → `Kext Signing: disabled`, `Debugging Restrictions: disabled`,
-  all other protections enabled, `Authenticated Root: enabled`.
+  `Kernel Integrity Protections: disabled` (`sip2`, accepted), all other
+  protections enabled, `Authenticated Root Requirement: enabled`.
 - `csrutil allow-research-guests status`.
 - `sudo bputil -d -j` → `security_mode: permissive`, `smb1: true`, `smb2: true`,
-  `sip0` as expected, `sip1: false`, `sip2: true`, `sip3: false` (`csrutil status`
-  does not display these), `auxp/auxi/auxr` still absent until the kext is
-  approved.
+  `sip0` as expected, `sip1: false`, `sip2: true`, `sip3: false`,
+  `auxp/auxi/auxr` still absent until the kext is approved.
 - `spctl kext-consent list` before and after approval.
 
 Open empirical question (the only one that can invalidate the plan):
@@ -553,6 +555,25 @@ Acceptance:
   rejected invalid inputs; the boundary-test probe evidence is kept
   (`kext-s3-probe.md`, outside git).
 - Every rollback step executed at least once and documented.
+
+### S3 log (2026-11-03, in progress)
+
+Evidence: private, `~/private/mac2jb-s3/` (one folder per phase, mode 0700).
+
+| Step | Result |
+|---|---|
+| Entry gate | preflight passes on `102ed45` (bundled driver byte-identical); `--verify` passes, `--status` `not-installed`; Time Machine backup exists on an external disk (operator) |
+| 1 Install | pinned build installed via the admin dialog (GUI path), root:wheel, both digests OK; `kmutil load -p` exits 27 "not approved to load", as expected before approval |
+| 2 Approval | UAKL updated; the AuxKC rebuild also took Apple's pending `com.apple.nke.rvi` (Xcode Remote Virtual Interface); reboot without panic |
+| 3 Identity | `--status` `verified`; one loaded `gay.bowser.usbgadget`, UUID `CF8E2A1A-9710-3430-998D-21A0E845D8B2`; `rvi` is in the AuxKC but not loaded; three services on `AppleT8132USBXDCI@0/1/2`, no user clients; an iPhone connected normally |
+| 4 Reject | 6 invalid inputs × 3 services refused, each with `kIOReturnBadArgument` |
+| 5 open-close | 1000 cycles × 3 services, all opens and closes succeed; user clients peak at 6 and return to 0 within 12 ms (F17 fixed on hardware) |
+| 5 poke | 8000 calls × 3 services; two processes × 320,000 calls on one service; 320,000 calls during 5000 open/close cycles; no hang, no error, slowest call 148 ms under contention |
+| Logs | no panic report; no kernel error since the reboot. `kernelmanagerd` logs "invalid codeful kernel extension in the restricted lookup table" for every AuxKC kext (also Apple's); the kext's debug log writes one line per user-client call (about 25,000 lines in these runs) |
+
+Still open: unload/reload cycles as root (one with a poke storm, `setProperties`
+during service teardown), unplug during a transfer, the functional test, log
+capture, and the rollback.
 
 ## 9. Risks and open questions
 
