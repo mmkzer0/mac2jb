@@ -2,18 +2,29 @@
 
 Status: the tightened preflight (path-independent build, provenance
 verification, KDK content check, resolved private path) passes on the clean
-commit `56668dc`. The private LocalPolicy snapshot is captured privately and
-matches the documented baseline; the S2 policy gate has not been applied. No
-SIP change, install, unload or kext load was performed by the preflight.
+commit `56668dc`. The S2 policy gate was applied on 2026-11-03 and accepted
+with one recorded risk: `sip2:true` (CTRR lock disabled), which
+`csrutil --without kext` sets unconditionally (`kext-hardening-plan.md` §2,
+§7.1). No install, unload or kext load has been performed. Rerun the preflight
+before a load attempt.
 
-**Private policy snapshot (2026-11-02):** one UUID node with 42 fields, mode
-`0600`, stored outside the repository. It confirms `security_mode: permissive`,
-`smb1: true` (Permissive Security), `smb2: false`, `sip0: 0x1014`, and
-`auxp/auxi/auxr` absent. Identifiers and hashes are not reproduced. The live
-`csrutil status` matches the public SIP bits. The selected target is to
-keep Permissive (`smb1:true`) and add `smb2:true`; the expected SIP mask is
-`0x1005` with research guests retained, otherwise `0x5`. `smb2:true` remains the
-missing gate; Reduced is not pursued.
+**Pre-S2 private policy snapshot (2026-11-02):** one UUID node with 42 fields,
+mode `0600`, stored outside the repository. It confirms `security_mode:
+permissive`, `smb1: true` (Permissive Security), `smb2: false`, `sip0: 0x1014`,
+and `auxp/auxi/auxr` absent. Identifiers and hashes are not reproduced. The live
+`csrutil status` matched the public SIP bits at that time. The selected target
+was to keep Permissive (`smb1:true`) and add `smb2:true`. The originally expected
+SIP mask (`0x1005`, `sip2:false`) is not reachable with `csrutil`; the corrected
+target is `0x101D` with `sip2:true`. Reduced is not pursued.
+
+**Post-S2 private policy snapshot (2026-11-03):** one UUID node with 42 fields,
+mode `0600`, stored outside the repository. It confirms `security_mode:
+permissive`, `smb1:true`, `smb2:true`, `sip0: 0x101D`, `sip1:false`,
+`sip2:true`, `sip3:false`, and `auxp/auxi/auxr` absent. `spctl kext-consent
+list` reports no configuration (exit 0). This matches the corrected target;
+`sip2:true` (CTRR lock disabled) is the accepted risk in
+`kext-hardening-plan.md` §7.1, valid until the S3 rollback.
+Identifiers and hashes are not reproduced.
 
 This is the pre-load check for the S2 policy gate. It does not replace the
 mock-IOKit harness or the S3 hardware gate.
@@ -87,7 +98,7 @@ Run of 2026-11-03 on the clean commit `56668dc` (exit 0, no blockers):
 | Current state | `usbgadget` not loaded; target install path absent; the `csrutil status` line printed `Kext Signing: disabled` (information only) |
 | Private LocalPolicy | captured earlier, mode `0600`, outside the repo (see above) |
 | Rollback | documented in `kext-hardening-plan.md`; not executed |
-| SIP / install / load | untouched |
+| SIP / install / load | the preflight itself changed none; S2 was applied later (see Status) |
 
 A passing preflight therefore requires committing the kext source and
 `build-kext.sh` first; the executable hash is a function of the source digest
@@ -99,16 +110,12 @@ inputs.
 
 ## Next steps
 
-1. Selected target: keep Permissive (`smb1:true`) and enable third-party kexts
-   (`smb2:true`). Set the SIP mask to `0x1005` with research guests retained
-   (current) or `0x5` without them.
-2. Run the one recoveryOS S2 policy session from
-   `kext-hardening-plan.md` §7, with explicit approval. The preflight itself
-   never changes SIP.
-3. Keep the preflight green: rerun it after any source, toolchain or policy
-   change before a load attempt. To refresh the private snapshot after a policy
-   change, use `--private-policy-out` only with explicit approval; never commit
-   it.
+1. S2 is accepted with the `sip2` risk acceptance; the S2 negative control is
+   `NOT_EXECUTED` and must not be reproduced by a load attempt.
+2. Keep the preflight green: rerun it before S3 and after any source,
+   toolchain or policy change before a load attempt. To refresh the private
+   snapshot, use `--private-policy-out` only with explicit approval; never
+   commit it.
 
 ## Early S3 non-root probe
 

@@ -2,8 +2,9 @@
 
 Status: implementation record for S1 and the S1.1 follow-up; the S2 preflight
 passes with the matching KDK and the private policy snapshot is captured
-privately. The selected target keeps the Permissive baseline and adds kexts;
-the policy gate has not been applied and hardware loading remains S3.
+privately. The S2 policy gate was applied and accepted on 2026-11-03
+(`smb2:true`; `sip2:true`, CTRR lock disabled, is a recorded risk acceptance
+until the S3 rollback); hardware loading remains S3 and has not started.
 Scope: `vendor/macos_usb_gadget_poc/usbgadget/usbgadget/` (service and user
 client), the S1/S1.1 mock harness, and the static gate.
 

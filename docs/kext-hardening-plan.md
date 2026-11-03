@@ -68,61 +68,94 @@ Policy facts (Apple Platform Security):
 - `bputil -k/--enable-kexts` enables trust in a locally SEP-signed AuxKC and
   downgrades to Reduced Security if needed.
 
-Current LocalPolicy on the target Mac (relevant fields only; the full dump is
-private and must not be published — it contains ECID, kuid, vuid and hashes):
+Pre-S2 LocalPolicy baseline (2026-11-02; relevant fields only; the full dump
+is private and must not be published — it contains ECID, kuid, vuid and
+hashes):
 
 | Field | Value | Meaning |
 |---|---|---|
 | `smb0` | true | Reduced-or-lower next stage allowed |
 | `smb1` | true | Permissive Security active |
-| `smb2` | false | **third-party kexts not enabled — the missing gate** |
+| `smb2` | false | third-party kexts not enabled in the pre-S2 baseline |
 | `sip0` | 0x1014 | TASK_FOR_PID (0x4), APPLE_INTERNAL (0x10), RESEARCH_GUESTS (0x1000) |
 | `sip1..3` | false | SSV check, CTRR, boot-arg filtering enforced |
-| `auxp/auxi/auxr` | false | the three AuxKC fields are absent in the current LocalPolicy (see note) |
+| `auxp/auxi/auxr` | false | the three AuxKC fields are absent in the baseline (see note) |
 
 The three fields are distinct: `auxp` hashes the user-authorized kext list (UAKL)
 policy, `auxi` hashes the AuxKC Image4 manifest, `auxr` hashes the AuxKC receipt.
-Their absence in the current policy does not prove that an AuxKC was never built;
+Their absence in the baseline does not prove that an AuxKC was never built;
 each field is verified separately in S3 after approval.
 
-`csrutil` bit mapping (verified by disassembly of `csrutil` from macOS 27,
-`-[CSRSecurityConfig …]` setters, masks passed to `_setSIPflag:enabled:`):
+Post-S2 LocalPolicy (2026-11-03; same 42-field schema, full dump private):
 
-| CLI name | Setter | SIP mask |
+| Field | Value | Meaning |
 |---|---|---|
-| `kext` | `setKextSigningRequired:` | `0x1` `CSR_ALLOW_UNTRUSTED_KEXTS` |
+| `security_mode` | permissive | Permissive Security |
+| `smb0` | true | Reduced-or-lower next stage allowed |
+| `smb1` | true | Permissive Security active |
+| `smb2` | true | third-party kexts enabled |
+| `sip0` | 0x101D | 0x1000 research + 0x10 Apple Internal + 0x8 kernel debugger + 0x4 task_for_pid + 0x1 untrusted kexts |
+| `sip1` | false | SSV root-hash verification enforced |
+| `sip2` | true | CTRR lock disabled by iBoot; set by `--without kext`, accepted risk (§7.1) |
+| `sip3` | false | boot-arg allow list enforced |
+| `auxp/auxi/auxr` | absent | no UAKL/AuxKC approval yet |
+
+All three extra bits come from `csrutil --without kext` itself (mapping below):
+`0x1` and `0x8` are stored, and `sip2` is set. `0x10` is `csrutil`'s default and
+was already in the baseline. `csrutil status` does not display `sip2`, so S2
+verification must read `sip1..3` from the private `bputil` dump.
+
+`csrutil` bit mapping (disassembly of `/usr/bin/csrutil`, macOS 27.0 `26A428`,
+SHA-256 `9757bba7656bd3111d5177314eb02faecede9f4ab4c2be08fbd913c9de4b3d7b`;
+`-[CSRSecurityConfig …]` setters). The configuration is `{u64 sip0; bool sip1;
+bool sip2; bool sip3}` at `self+8`, passed to `bootpolicy_get/update_sip_flags`:
+
+| CLI name | Setter | Effect when the restriction is lifted |
+|---|---|---|
+| `kext` | `setKextSigningRequired:` | `0x1` `CSR_ALLOW_UNTRUSTED_KEXTS`, then `setKernelDebuggingRestricted:NO` |
 | `fs` | `setFilesystemAccessRestricted:` | `0x2` |
 | `debug` | `setDebuggingRestricted:` | `0x4` `CSR_ALLOW_TASK_FOR_PID` only |
-| `dtrace` | `setDTraceRestricted:` | `0x20` |
+| `dtrace` | `setDTraceRestricted:` | `0x20`, then `setCTRREnforcementRequired:NO` |
 | `nvram` | `setNVRAMAccessRestricted:` | `0x40` |
-| (no CLI alias) | `setKernelDebuggingRestricted:` | `0x8` |
+| (no CLI alias) | `setKernelDebuggingRestricted:` | `0x8`, then `setCTRREnforcementRequired:NO` |
+| (no CLI alias) | `setCTRREnforcementRequired:` | `sip2` (`self+0x11`) |
+| (`authenticated-root`, alias not traced) | `setARVSealingRequired:` | `sip1` (`self+0x10`) and `0x800` |
+| (no CLI alias) | `setBootArgFilteringEnabled:` | `sip3` (`self+0x12`) |
 | (no CLI alias) | `setResearchGuestAllowed:` | `0x1000` |
 
 Consequences:
 
-- `--without kext` sets `0x1`, i.e. the *unsigned kext* flag. It is not
-  `CSR_ALLOW_UNAPPROVED_KEXTS` (0x200).
-- `--without debug` sets only `0x4`, which matches the current `sip0`. The
-  kernel separately synthesizes `CSR_ALLOW_KERNEL_DEBUGGER` (0x8) in `csr_check()`
-  when `0x1` or `0x10` is set (`bsd/kern/kern_csr.c`), so enabling the kext bit
-  also implicitly allows kernel debugging. This is documented Apple behavior.
-- `CSR_ALLOW_APPLE_INTERNAL` (0x10) is **masked out at boot** on non-IUOU/IUOS
-  hardware (`kern_csr.c`). A stored bit therefore does not make it active, and
-  no local project can depend on it. Losing it in a rewrite is harmless.
+- `--without kext` always produces `0x1 | 0x8` and `sip2:true`. No `csrutil`
+  invocation yields the unsigned-kext bit with CTRR locked, and `bputil` cannot
+  re-enable CTRR: it only has `-c` to disable it, and `-n`/`-g` recreate the
+  policy without any `sip0`. CTRR stays locked only for a kext with
+  a kext-enabled Developer ID signature (no `0x1`), which §1 excludes.
+- `0x1` is the *unsigned kext* flag, not `CSR_ALLOW_UNAPPROVED_KEXTS` (0x200).
+- `--without debug` sets only `0x4`. The kernel additionally synthesizes
+  `CSR_ALLOW_KERNEL_DEBUGGER` (0x8) in `csr_check()` when `0x1` or `0x10` is set
+  (`bsd/kern/kern_csr.c`), but with `--without kext` the bit is stored anyway.
+- `-[CSRSecurityConfig init]` starts with `sip0 = 0x10`
+  (`CSR_ALLOW_APPLE_INTERNAL`). The kernel masks this bit at boot on non-IUOU/IUOS
+  hardware (`kern_csr.c`), so it is stored but never active.
 - `csrutil enable --without …` rebuilds the whole mask; unlisted exceptions
   (including research guests) are cleared and must be re-applied explicitly.
 - Both repeated flags (`--without debug --without kext`) and comma lists
   (`--without debug,kext`) are accepted; unknown tokens fail with
   `invalid option %s.`
+- Scope of the evidence: this is the macOS `csrutil`; recoveryOS runs its own
+  copy. The observed post-S2 dump matches the mapping exactly.
 
-Target state after S2 (selected Permissive variant, expected):
+Target state after S2 (selected Permissive variant, corrected 2026-11-03):
 
 - `security_mode: permissive`, `smb1: true` (unchanged)
 - `smb2: true`
-- `sip0 = 0x1005` with research guests retained (current state), otherwise
-  `0x5` (`kext` + `debug`)
+- `sip0 = 0x101D` with research guests retained, otherwise `0x1D`
+- `sip1: false`, `sip2: true` (accepted risk, §7.1), `sip3: false`
 - `auxp/auxi/auxr` created on the first kext approval
 - `Kext Signing: disabled`, `Debugging Restrictions: disabled`, everything else enabled
+
+The original target (`sip0 = 0x1005`, `sip2: false`) was not reachable with
+`csrutil`; the actual 2026-11-03 result in §7.1 matches the corrected target.
 
 The stricter Reduced variant would use `smb1: false` and the same SIP target.
 
@@ -291,9 +324,10 @@ bundle and dependency diagnostics, the public SIP state, and rollback
 readiness. It never changes SIP, installs, unloads or loads. The current result
 is recorded in `kext-s2-preflight.md`: the preflight passes with the matching
 KDK; the private LocalPolicy snapshot is captured and matches the documented
-Permissive baseline. The policy gate itself remains pending; `smb2:true` is
-still missing. On 2026-11-02 the target was selected as **keep Permissive +
-enable kexts**; Reduced is not pursued.
+Permissive baseline. The policy gate was applied on 2026-11-03 and S2 is
+accepted with one recorded risk: `sip2:true` (CTRR lock disabled), which
+`csrutil --without kext` sets unconditionally; see §7.1. On 2026-11-02 the target
+was selected as **keep Permissive + enable kexts**; Reduced is not pursued.
 
 Preconditions: S1 accepted and the preflight report says `PASS: no preflight
 blockers`; a KDK matching macOS 27.0 (build 26A428) installed; full
@@ -309,14 +343,17 @@ Steps, in this order:
    `smb1: true`, `smb2: true`. If the checkbox is unavailable under Permissive,
    run `bputil -k` to enable kexts, then verify the resulting mode; if it
    changes to Reduced, re-select Permissive and re-check `smb2`. The general
-   alternative remains Reduced Security + the same checkbox.
+   alternative remains Reduced Security + the same checkbox. Do not pass
+   `bputil -a` (boot-arg allow list) or `-s` (SSV); those are separate
+   downgrades and are outside S2. `bputil -c` is not needed either: step 3
+   disables CTRR anyway (§2).
 3. Set the minimal SIP mask: `csrutil enable --without debug,kext`
    (alternative spelling: `--without debug --without kext`).
-   Expected `sip0 = 0x5`.
+   Expected `sip0 = 0x1D`, `sip2: true`.
 4. Re-enable research guests if they are needed:
-   `csrutil allow-research-guests enable` (expected `sip0 = 0x1005`). The current
-   policy has research guests enabled; keep them unless they are no longer
-   required.
+   `csrutil allow-research-guests enable` (expected `sip0 = 0x101D`). The
+   current policy has research guests enabled; keep them unless they are no
+   longer required.
 5. Restart.
 
 Verification after boot:
@@ -325,7 +362,9 @@ Verification after boot:
   all other protections enabled, `Authenticated Root: enabled`.
 - `csrutil allow-research-guests status`.
 - `sudo bputil -d -j` → `security_mode: permissive`, `smb1: true`, `smb2: true`,
-  `sip0` as expected, `auxp/auxi/auxr` still absent until the kext is approved.
+  `sip0` as expected, `sip1: false`, `sip2: true`, `sip3: false` (`csrutil status`
+  does not display these), `auxp/auxi/auxr` still absent until the kext is
+  approved.
 - `spctl kext-consent list` before and after approval.
 
 Open empirical question (the only one that can invalidate the plan):
@@ -336,15 +375,54 @@ Open empirical question (the only one that can invalidate the plan):
   Failure signature to capture: the exact `kmutil load -p` error. Fallback
   options, in order: ad-hoc sign the built kext; sign with the available Apple
   Development identity (likely insufficient for `kmd`); temporarily Permissive.
-- Note: `Kext Signing: disabled` plus `0x1` also synthesizes kernel-debugger
-  permission via `csr_check()`. Accept and record; do not add 0x8 explicitly.
+- Note: `--without kext` stores `0x8` (kernel debugger) and sets `sip2`; both
+  are part of the accepted S2 state.
 
 Acceptance:
 
-- `security_mode: permissive`, `smb1: true`, `smb2: true`, expected `sip0`,
-  research guests state recorded.
-- Negative control captured: what `kmutil load -p` reports for the shipped
-  unsigned kext before the policy change (expected: policy/signature failure).
+- `security_mode: permissive`, `smb1: true`, `smb2: true`, `sip0` as expected,
+  `sip1: false`, `sip2: true` (accepted risk), `sip3: false`, research guests
+  state recorded.
+- Negative control: what `kmutil load -p` reports for the shipped unsigned kext
+  before the policy change (expected: policy/signature failure).
+
+### S2 result (2026-11-03)
+
+The policy gate was applied before the 2026-11-03 post-S2 snapshot. The pre-S2
+snapshot (`bputil-pre-s2-2026-11-02.json`) and post-S2 snapshots
+(`bputil-after-s2.json`, `bputil-2026-11-03.json`) are private, mode `0600`;
+the two post-S2 snapshots are byte-identical.
+
+| Check | Actual |
+|---|---|
+| `security_mode` | `permissive` |
+| `smb1` / `smb2` | `true` / `true` |
+| `sip0` | `0x101D` |
+| `sip1` / `sip2` / `sip3` | `false` / **`true`** / `false` |
+| `auxp` / `auxi` / `auxr` | absent |
+| `spctl kext-consent list` | no configuration, exit 0 |
+| loaded / installed | no `usbgadget`; empty AuxKC; install path absent |
+
+`smb2` is set. Every deviation from the original target comes from
+`csrutil --without kext` (§2): it stores `0x1` and `0x8` and sets `sip2`. `0x10`
+is the `csrutil` default and is masked at boot. `sip2=true` means iBoot no
+longer locks CTRR, so kernel text stays writable for any code that already has a
+kernel write primitive. It does not let user space write kernel memory. It
+cannot be avoided for an unsigned kext with Apple's tools.
+
+S2 is **accepted** on 2026-11-03 with this risk acceptance:
+
+- Risk: `sip2:true` (CTRR lock disabled) together with stored `0x8` (kernel
+  debugger) on the primary M4 Pro.
+- Reason: required by the unsigned research kext; a kext-enabled Developer ID is
+  out of scope (§1).
+- Limit: valid until S3 rollback. Rollback step 3 must leave `sip2` absent; a
+  fresh `bputil -d -j` after the reboot proves it.
+
+Negative control: `NOT_EXECUTED`. No `kmutil load -p` artifact was recorded
+before the gate. It must not be reproduced now, because `smb2:true` plus the
+kext SIP bit could attempt the load. Rerun `scripts/kext-s2-preflight.sh` before
+S3.
 
 ## 8. S3 — hardware validation
 
@@ -380,7 +458,9 @@ Mac restarts. Rollback therefore needs two separate proofs:
      is empty (neither loaded nor present in the AuxKC),
    - `kmutil showloaded --show unloaded --list-only | grep usbgadget` is empty.
 3. SIP: in recoveryOS `csrutil enable --without debug`, then
-   `csrutil allow-research-guests enable` if it was previously on.
+   `csrutil allow-research-guests enable` if it was previously on. After the
+   reboot `sudo bputil -d -j` must show `sip2` absent (CTRR locked again) and
+   `sip0` without `0x1`/`0x8`. Do not stop rollback before this check.
 4. LocalPolicy: restore `smb2` only if the kext capability must be withdrawn.
 
 Acceptance:
@@ -402,6 +482,9 @@ Acceptance:
   vphone docs before S2; the plan re-enables it regardless and verifies).
 - The Apple Development identity (`VL6526N68N`) is not a Developer ID; do not
   build the plan on it.
+- CTRR is disabled from S2 until rollback (`sip2:true`, §7.1). A kernel
+  exploit in that window can patch kernel text. Keep the window short and do
+  not run untrusted kernel-facing code on the host during it.
 
 ## 10. Privacy
 

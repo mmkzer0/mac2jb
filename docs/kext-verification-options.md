@@ -133,8 +133,10 @@ Sources:
   `de79702967e272694568d6545f4e131bfcf0b21509c1cc3aab8c4c4c572674c5`, the
   same from two checkout paths.
 - S2 preflight: pass with `KDK_27.0_26A428.kdk`; private LocalPolicy captured
-  privately. Selected target is Permissive + kexts (`smb1:true`, `smb2:true`,
-  `sip0=0x1005` with research guests); no SIP change, install or load yet.
+  privately. S2 policy applied and accepted 2026-11-03 (`security_mode:
+  permissive`, `smb1:true`, `smb2:true`, `sip0=0x101D`); `sip2:true` (CTRR lock
+  disabled) is a recorded risk acceptance because `csrutil --without kext` sets
+  it; no install or load yet.
 - Not yet: iterator-creation and second-`getNextObject` sweep sites, tagged
   registry, two-tier self-check, coverage, mutation, TLA+ model. The early-S3
   non-root registry probe runs after the kext is loaded, not before.
