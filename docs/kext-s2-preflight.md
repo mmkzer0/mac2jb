@@ -1,12 +1,10 @@
 # S2 preflight (no SIP change)
 
-Status: the 2026-11-02 run passed under the earlier contract (same-path double
-build, KDK presence by directory name). The preflight has since been
-tightened (path-independent build, provenance verification, KDK content check,
-resolved private path); the checks are described below. The private LocalPolicy
-snapshot is captured privately and matches the documented baseline; the S2
-policy gate has not been applied. No SIP change, install, unload or kext load
-was performed by the preflight.
+Status: the tightened preflight (path-independent build, provenance
+verification, KDK content check, resolved private path) passes on the clean
+commit `56668dc`. The private LocalPolicy snapshot is captured privately and
+matches the documented baseline; the S2 policy gate has not been applied. No
+SIP change, install, unload or kext load was performed by the preflight.
 
 **Private policy snapshot (2026-11-02):** one UUID node with 42 fields, mode
 `0600`, stored outside the repository. It confirms `security_mode: permissive`,
@@ -74,9 +72,7 @@ rejects `-n`. Use `kmutil print-diagnostics`.
 
 ## Result
 
-Run of 2026-11-03 against the working tree after the provenance rework (the
-tree was dirty: `usbgadget_userclient.cpp` and `build-kext.sh` carried
-uncommitted edits):
+Run of 2026-11-03 on the clean commit `56668dc` (exit 0, no blockers):
 
 | Check | Result |
 |---|---|
@@ -85,7 +81,7 @@ uncommitted edits):
 | KDK content | pass: `KDK_27.0_26A428.kdk`, SystemVersion 27.0 / 26A428, 14 arm64 release kernels |
 | S1 source gate / harness | pass |
 | Path-independent build | pass: the in-tree build and the build from a copy at another path (with a space) have the same executable SHA-256 `de79702967e272694568d6545f4e131bfcf0b21509c1cc3aab8c4c4c572674c5` (109296 bytes) and the same source digest |
-| Provenance verify | **fail, as designed:** `dirty` and `record-dirty` (uncommitted build inputs); it passes only on a clean, committed tree |
+| Provenance verify | pass: `dirty=false`, source digest `8987e0c90680e7a1f57e646c0cd8a9a339bced3cf737fec4a37f45e5d09a3e11`, build script and artifact match |
 | Bundle | pass: two files, no symlinks, `Info.plist` lint, arm64e, unsigned as built |
 | Bundle linkage | pass (`kmutil print-diagnostics`; user-owned and unsigned diagnostics are expected pre-install) |
 | Current state | `usbgadget` not loaded; target install path absent; the `csrutil status` line printed `Kext Signing: disabled` (information only) |
