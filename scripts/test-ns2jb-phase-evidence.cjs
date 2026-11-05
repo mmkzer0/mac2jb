@@ -3,8 +3,14 @@ const fs = require('node:fs');
 const test = require('node:test');
 const assert = require('node:assert');
 const path = require('node:path');
-const {summarize, summarizeCopyStep, classifyAliasObservation, summarizeRangeLeak} = require(path.join(__dirname, '..',
-  'vendor/ns2jb/engine/switch2/memory/phase-evidence.cjs'));
+const {
+  summarize,
+  summarizeCopyStep,
+  classifyAliasObservation,
+  summarizeRangeLeak,
+  classifyRunOutcome
+} = require(path.join(__dirname, '..', 'vendor/ns2jb/engine/switch2/memory/phase-evidence.cjs'));
+const {findNativeLinks} = require(path.join(__dirname, '..', 'vendor/ns2jb/engine/switch2/memory/native-links.cjs'));
 
 const row = overrides => ({
   restored: true, triggerAborted: false, allPending: true,
@@ -224,17 +230,37 @@ test('summarizeRangeLeak forms a mutually exclusive block partition and separate
   assert.equal(forensics.encodableLinkCandidates, 1);
 });
 
-test('summarizeRangeLeak matches conserved T0a2CC hardware over-read dump when present', t => {
-  const dir = '/Users/lennartk/private/mac2jb-s3/20261105-switch2-T0a2CC-alias-pass/switch2/memory';
-  const outPath = path.join(dir, 'reserved-gap-1793893081989-range-output.bin');
-  const ctrlPath = path.join(dir, 'reserved-gap-1793893081989-range-control.bin');
-  if (!fs.existsSync(outPath) || !fs.existsSync(ctrlPath)) {
-    t.skip('Private T0a2CC hardware dump not present on this machine');
+test('summarizeRangeLeak and nativeLinks match conserved T0a2CC hardware over-read dump when NS2JB_GOLDEN_DIR is set', async t => {
+  const dir = process.env.NS2JB_GOLDEN_DIR;
+  if (!dir) {
+    t.skip('Set NS2JB_GOLDEN_DIR to run hardware golden dump assertions');
     return;
   }
+  const prefix = 'reserved-gap-1793893081989';
+  const outPath = path.join(dir, `${prefix}-range-output.bin`);
+  const ctrlPath = path.join(dir, `${prefix}-range-control.bin`);
+  const beforeReleasePath = path.join(dir, `${prefix}-before-release-0.bin`);
+  const primedPath = path.join(dir, `${prefix}-fragment-primed.bin`);
+  const free0Path = path.join(dir, `${prefix}-fragment-free-0.bin`);
+  const free1Path = path.join(dir, `${prefix}-fragment-free-1.bin`);
+  for (const requiredFile of [outPath, ctrlPath, beforeReleasePath, primedPath, free0Path, free1Path]) {
+    assert.ok(fs.existsSync(requiredFile), `Missing required golden dump file: ${requiredFile}`);
+  }
+
+  const expectedSha256 = 'c8b01df80674952242c102eb41a906a9a6a10c8cd5459030c4e9ace8c03d6d3b';
+  const snapshots = [
+    {name: 'before-release-0', outputFile: beforeReleasePath, outputSha256: expectedSha256},
+    {name: 'initial', outputFile: outPath, outputSha256: expectedSha256},
+    {name: 'fragment-primed', outputFile: primedPath, outputSha256: expectedSha256},
+    {name: 'fragment-free-0', outputFile: free0Path, outputSha256: expectedSha256},
+    {name: 'fragment-free-1', outputFile: free1Path, outputSha256: expectedSha256}
+  ];
+  const candidates = await findNativeLinks(snapshots, true);
+  assert.deepEqual(candidates, []);
+
   const widened = fs.readFileSync(outPath);
   const control = fs.readFileSync(ctrlPath);
-  const forensics = summarizeRangeLeak(widened, control, []);
+  const forensics = summarizeRangeLeak(widened, control, candidates);
   assert.equal(forensics.totalBlocks, 128);
   const sum = Object.values(forensics.partition).reduce((a, b) => a + b, 0);
   assert.equal(sum, 128);
@@ -259,4 +285,51 @@ test('summarizeRangeLeak matches conserved T0a2CC hardware over-read dump when p
   assert.equal(forensics.overReadRawPointers16kAligned, 0);
   assert.equal(forensics.qualifiedLinkCandidates, 0);
   assert.equal(forensics.encodableLinkCandidates, 0);
+});
+
+test('classifyRunOutcome separates worker stalls, heap drift, alias misses, and post-alias link exhaustion', () => {
+  const t0a2cc = classifyRunOutcome({
+    markerSelected: true,
+    markerReproduced: true,
+    cacheAlias: {selectedAlias: true, attempts: [{attempt: 0}]},
+    cacheRange: {completed: true},
+    linkCandidates: [],
+    error: 'Error: The bounded native leak contains no qualified, encodable link candidate'
+  });
+  assert.equal(t0a2cc.category, 'no-native-links');
+  assert.equal(t0a2cc.substage, 'native-links');
+
+  const bbunsz = classifyRunOutcome({
+    markerSelected: true,
+    markerReproduced: true,
+    cacheAlias: {selectedAlias: false, attempts: []},
+    error: 'Error: General-heap allocation changed while the cache was retained; stop overwrites and recover'
+  });
+  assert.equal(bbunsz.category, 'general-heap-drift');
+  assert.equal(bbunsz.substage, 'alias-copy');
+
+  const stallEvents = [
+    {operation: 'workerStarted', label: 'reserved-gap-1-12'},
+    {operation: 'timing', stage: 'join:positive', passed: false}
+  ];
+  const stallRepro = classifyRunOutcome({
+    markerSelected: true,
+    markerReproduced: false,
+    error: 'Error: Native batch did not terminate; resources retained'
+  }, stallEvents);
+  assert.equal(stallRepro.category, 'native-worker-stall');
+  assert.equal(stallRepro.substage, 'canary-reproduce');
+  assert.equal(stallRepro.stalledWorkerIndex, 0);
+  assert.equal(stallRepro.stalledWorkerRole, 'commit');
+  assert.equal(stallRepro.joinedBeforeStall, 0);
+
+  const aliasMiss = classifyRunOutcome({
+    markerSelected: true,
+    markerReproduced: true,
+    metadataAttempts: 4,
+    cacheAlias: {selectedAlias: false, attempts: [{}, {}, {}, {}]},
+    error: 'Error: Clean alias did not qualify within its attempt limit'
+  });
+  assert.equal(aliasMiss.category, 'alias-not-selected');
+  assert.equal(aliasMiss.substage, 'alias-read');
 });

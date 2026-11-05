@@ -207,6 +207,76 @@ function summarizeRangeLeak(widenedBytes, controlBytes, linkCandidates = [], out
   };
 }
 
+const WORKER_ROLES = [
+  'commit', 'hole', 'tail0', 'tail1', 'tail2', 'tail3', 'canary',
+  'filler0', 'filler1', 'release', 'guard0', 'guard1', 'trigger'
+];
+
+function classifyRunOutcome(report, events = []) {
+  const error = typeof report?.error === 'string' ? report.error : '';
+  const selectedAlias = Boolean(report?.cacheAlias?.selectedAlias);
+  const rangeCompleted = Boolean(report?.cacheRange?.completed);
+  const linkCount = report?.linkCandidates?.length ?? 0;
+  const addressCompleted = Boolean(report?.cacheAddress?.completed);
+  const markerSelected = Boolean(report?.markerSelected);
+  const markerReproduced = Boolean(report?.markerReproduced);
+  const aliasAttempts = report?.cacheAlias?.attempts?.length ?? 0;
+  const maxAttempts = report?.metadataAttempts ?? 4;
+
+  let substage = 'canary-select';
+  if (addressCompleted || report?.ready) substage = 'completed';
+  else if (rangeCompleted && linkCount > 0) substage = 'address-plan';
+  else if (rangeCompleted) substage = 'native-links';
+  else if (selectedAlias) substage = 'cache-range';
+  else if (aliasAttempts >= maxAttempts) substage = 'alias-read';
+  else if (markerReproduced) substage = 'alias-copy';
+  else if (markerSelected) substage = 'canary-reproduce';
+
+  let category = 'other-error';
+  if (report?.ready && addressCompleted) category = 'ready';
+  else if (rangeCompleted && linkCount > 0 && !addressCompleted) category = 'address-plan-failed';
+  else if (selectedAlias && rangeCompleted && linkCount === 0) category = 'no-native-links';
+  else if (selectedAlias && !rangeCompleted) category = 'cache-range-failed';
+  else if (!selectedAlias && aliasAttempts >= maxAttempts && error.includes('Clean alias did not qualify'))
+    category = 'alias-not-selected';
+  else if (error.includes('General-heap allocation changed')) category = 'general-heap-drift';
+  else if (error.includes('Native batch did not terminate')) category = 'native-worker-stall';
+  else if (error.includes('Overwrite missed the qualified canary')) category = 'canary-overwrite-missed';
+  else if (error.includes('socket hang up') || error.includes('ECONNRESET')) category = 'transport-disconnected';
+  else if (!report?.completed && !error) category = 'host-stage-timeout';
+
+  let stalledWorkerIndex = null;
+  let stalledWorkerRole = null;
+  let joinedBeforeStall = null;
+  if (category === 'native-worker-stall' && Array.isArray(events) && events.length > 0) {
+    let lastStart12 = -1;
+    for (let i = events.length - 1; i >= 0; i--) {
+      if (events[i]?.operation === 'workerStarted' && String(events[i]?.label ?? '').endsWith('-12')) {
+        lastStart12 = i;
+        break;
+      }
+    }
+    if (lastStart12 !== -1) {
+      const joined = events.slice(lastStart12 + 1).filter(e => e?.operation === 'workerJoined');
+      joinedBeforeStall = joined.length;
+      stalledWorkerIndex = joined.length;
+      stalledWorkerRole = WORKER_ROLES[stalledWorkerIndex] ?? `worker-${stalledWorkerIndex}`;
+    }
+  }
+  return {
+    category,
+    substage,
+    markerSelected,
+    markerReproduced,
+    aliasAttempts,
+    selectedAlias,
+    rangeCompleted,
+    stalledWorkerIndex,
+    stalledWorkerRole,
+    joinedBeforeStall
+  };
+}
+
 module.exports = {
   hasWindow,
   canaryChanged,
@@ -214,5 +284,6 @@ module.exports = {
   summarize,
   summarizeCopyStep,
   classifyAliasObservation,
-  summarizeRangeLeak
+  summarizeRangeLeak,
+  classifyRunOutcome
 };
