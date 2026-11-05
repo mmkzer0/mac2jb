@@ -9,7 +9,7 @@ const {RunControl, StopRequested, reportWriter} = require("./run-control.cjs");
 const {packPages} = require("./session-tools.cjs");
 const {paths, pathPacket, pathPackets} = require("./paths.cjs");
 const normalizedPath = require("./normalized-path.cjs");
-const {hasWindow, summarize, summarizeCopyStep, classifyAliasObservation} = require("./phase-evidence.cjs");
+const {hasWindow, summarize, summarizeCopyStep, classifyAliasObservation, summarizeRangeLeak} = require("./phase-evidence.cjs");
 const {packet, response} = require("../../shared/ipc.cjs");
 const functions = require("../../shared/sdk-functions.json");
 
@@ -870,6 +870,7 @@ async function main() {
               range.outputSha256 = hash(widened.bytes);
               range.firstDifference = widened.bytes.findIndex((byte, i) => byte !== control.bytes[i]);
               range.prefixMatches = widened.bytes.subarray(0, 0x4000).equals(control.bytes.subarray(0, 0x4000));
+              range.forensics = summarizeRangeLeak(widened.bytes, control.bytes, [], range.outputPoison);
             }
             await save();
             if ((widened.bytes) && range.prefixMatches && range.firstDifference >= 0x4000) {
@@ -928,6 +929,10 @@ async function main() {
               'Combined acquisition needs a qualified native over-read');
             const candidates = await nativeLinks(range);
             report.linkCandidates = candidates;
+            if (range.forensics) {
+              range.forensics.qualifiedLinkCandidates = candidates.length;
+              range.forensics.encodableLinkCandidates = candidates.filter(item => item.encodable).length;
+            }
             await save();
             const selected = candidates.find(item => item.encodable);
             check(selected, 'The bounded native leak contains no qualified, encodable link candidate');

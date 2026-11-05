@@ -2,7 +2,7 @@
 const test = require('node:test');
 const assert = require('node:assert');
 const path = require('node:path');
-const {summarize, summarizeCopyStep, classifyAliasObservation} = require(path.join(__dirname, '..',
+const {summarize, summarizeCopyStep, classifyAliasObservation, summarizeRangeLeak} = require(path.join(__dirname, '..',
   'vendor/ns2jb/engine/switch2/memory/phase-evidence.cjs'));
 
 const row = overrides => ({
@@ -168,4 +168,52 @@ test('classifyAliasObservation distinguishes redirect, poison, partial prefix, a
   });
   assert.equal(errObs.classification, 'ipc-error');
   assert.equal(errObs.selectedAlias, false);
+});
+
+test('summarizeRangeLeak forms a mutually exclusive block partition and separates raw pointers from qualified links', () => {
+  const blockSize = 0x4000;
+  const control = Buffer.alloc(blockSize * 4, 0x11);
+  for (let i = 0; i < 4; i++) control.writeUInt32LE(0x1000 + i, i * blockSize);
+
+  // Build 8 blocks:
+  // 0: matches control[0] at same offset
+  // 1: matches control[3] at different offset
+  // 2: ascii-heavy block
+  // 3: exact duplicate of block 2
+  // 4: zero-filled block
+  // 5: poison-filled block (0xa5)
+  // 6: pointer-bearing block (head has 16k-aligned pointer, interior has 8-byte aligned pointer)
+  // 7: other binary block
+  const b0 = Buffer.from(control.subarray(0, blockSize));
+  const b1 = Buffer.from(control.subarray(3 * blockSize, 4 * blockSize));
+  const b2 = Buffer.alloc(blockSize, 0x41); // 'A'
+  const b3 = Buffer.from(b2);
+  const b4 = Buffer.alloc(blockSize, 0x00);
+  const b5 = Buffer.alloc(blockSize, 0xa5);
+  const b6 = Buffer.alloc(blockSize, 0x80);
+  b6.writeBigUInt64LE(0x123454000n, 0); // 16k-aligned block head pointer
+  b6.writeBigUInt64LE(0x123456788n, 0x100); // 8-byte aligned interior pointer
+  const b7 = Buffer.alloc(blockSize, 0xfe);
+
+  const widened = Buffer.concat([b0, b1, b2, b3, b4, b5, b6, b7]);
+  const forensics = summarizeRangeLeak(widened, control, [{target: 0x123454000, encodable: true}]);
+  assert.equal(forensics.totalBlocks, 8);
+  const sum = Object.values(forensics.partition).reduce((a, b) => a + b, 0);
+  assert.equal(sum, forensics.totalBlocks);
+  assert.deepEqual(forensics.partition, {
+    matchesControlSameOffset: 1,
+    matchesControlOtherOffset: 1,
+    exactDuplicateBlocks: 1,
+    zeroFilled: 1,
+    poisonFilled: 1,
+    pointerBearing: 1,
+    asciiHeavy: 1,
+    otherBinary: 1
+  });
+  assert.equal(forensics.overReadBlockHeadsInRange, 1);
+  assert.equal(forensics.overReadBlockHeads16kAligned, 1);
+  assert.equal(forensics.overReadRawPointersTotal, 2);
+  assert.equal(forensics.overReadRawPointers16kAligned, 1);
+  assert.equal(forensics.qualifiedLinkCandidates, 1);
+  assert.equal(forensics.encodableLinkCandidates, 1);
 });

@@ -1,3 +1,4 @@
+const crypto = require('node:crypto');
 // Phase-level evidence for the reserved-gap probe.
 // A positive phase is unsafe only when it ended without a qualified marker and
 // at least one wave actually overwrote memory without aborting. A later hit in
@@ -114,4 +115,91 @@ function classifyAliasObservation({aliased, primeBytes, aliasControlBytes, outpu
   };
 }
 
-module.exports = {hasWindow, canaryChanged, markerObserved, summarize, summarizeCopyStep, classifyAliasObservation};
+function summarizeRangeLeak(widenedBytes, controlBytes, linkCandidates = [], outputPoison = 0xa5) {
+  const blockSize = 0x4000;
+  const totalBlocks = Math.floor(widenedBytes.length / blockSize);
+  const ctrlBlocks = new Map();
+  const ctrlCount = Math.floor((controlBytes?.length ?? 0) / blockSize);
+  for (let idx = 0; idx < ctrlCount; idx++) {
+    const off = idx * blockSize;
+    const h = crypto.createHash('sha256').update(controlBytes.subarray(off, off + blockSize)).digest('hex');
+    if (!ctrlBlocks.has(h)) ctrlBlocks.set(h, []);
+    ctrlBlocks.get(h).push(idx);
+  }
+  const seenOutHashes = new Set();
+  const partition = {
+    matchesControlSameOffset: 0,
+    matchesControlOtherOffset: 0,
+    exactDuplicateBlocks: 0,
+    zeroFilled: 0,
+    poisonFilled: 0,
+    pointerBearing: 0,
+    asciiHeavy: 0,
+    otherBinary: 0
+  };
+  let overReadBlockHeadsInRange = 0;
+  let overReadBlockHeads16kAligned = 0;
+  let overReadRawPointersTotal = 0;
+  let overReadRawPointers16kAligned = 0;
+
+  for (let idx = 0; idx < totalBlocks; idx++) {
+    const off = idx * blockSize;
+    const slice = widenedBytes.subarray(off, off + blockSize);
+    const h = crypto.createHash('sha256').update(slice).digest('hex');
+    const isDuplicate = seenOutHashes.has(h);
+    seenOutHashes.add(h);
+
+    let zeros = 0, poisons = 0, ascii = 0, blockPtrs = 0;
+    for (let i = 0; i < slice.length; i++) {
+      const b = slice[i];
+      if (b === 0) zeros++;
+      if (b === outputPoison) poisons++;
+      if ((b >= 0x20 && b <= 0x7e) || b === 0x0a || b === 0x0d || b === 0x09) ascii++;
+    }
+    for (let i = 0; i + 8 <= slice.length; i += 8) {
+      const v = slice.readBigUInt64LE(i);
+      const inRange = v >= 0x100000000n && v < (1n << 39n) && (v & 0xffffffn) !== 0n;
+      if (idx >= 1 && i === 0 && inRange) {
+        overReadBlockHeadsInRange++;
+        if (v % 0x4000n === 0n) overReadBlockHeads16kAligned++;
+      }
+      if (inRange && (v & 7n) === 0n) {
+        blockPtrs++;
+        if (idx >= 1) {
+          overReadRawPointersTotal++;
+          if (v % 0x4000n === 0n) overReadRawPointers16kAligned++;
+        }
+      }
+    }
+    const ctrlMatch = ctrlBlocks.get(h);
+    if (ctrlMatch && ctrlMatch.includes(idx)) partition.matchesControlSameOffset++;
+    else if (ctrlMatch) partition.matchesControlOtherOffset++;
+    else if (isDuplicate) partition.exactDuplicateBlocks++;
+    else if (zeros === blockSize) partition.zeroFilled++;
+    else if (poisons === blockSize) partition.poisonFilled++;
+    else if (blockPtrs > 0) partition.pointerBearing++;
+    else if (ascii > blockSize / 2) partition.asciiHeavy++;
+    else partition.otherBinary++;
+  }
+  return {
+    blockSize,
+    totalBlocks,
+    partition,
+    overReadBlockHeadsInRange,
+    overReadBlockHeads16kAligned,
+    overReadRawPointersTotal,
+    overReadRawPointers16kAligned,
+    qualifiedLinkCandidates: linkCandidates.length,
+    encodableLinkCandidates: linkCandidates.filter(item => item.encodable).length
+  };
+}
+
+module.exports = {
+  hasWindow,
+  canaryChanged,
+  markerObserved,
+  summarize,
+  summarizeCopyStep,
+  classifyAliasObservation,
+  summarizeRangeLeak
+};
