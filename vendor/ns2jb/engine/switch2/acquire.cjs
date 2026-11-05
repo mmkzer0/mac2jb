@@ -65,8 +65,12 @@ async function start() {
           }
         }
         if (report?.memoryControl?.ready) break;
-        if (exited || spawnError || Date.now() >= deadline)
-          throw Error('FS acquisition did not complete. Inspect ' + logFile + '; restart the console before another launch.');
+        if (exited || spawnError || Date.now() >= deadline) {
+          const latest = reportFile ? await read(reportFile).catch(() => null) : null;
+          const progress = latest?.progress?.stage ? ' (last stage: ' + latest.progress.stage + ')' : '';
+          throw Error('FS acquisition did not complete' + progress + '. Inspect ' + logFile +
+            '; restart the console before another launch.');
+        }
         await delay(500);
       }
       const publishable = async () => {

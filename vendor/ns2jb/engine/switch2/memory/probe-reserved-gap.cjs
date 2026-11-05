@@ -414,14 +414,22 @@ async function main() {
         }
         await affinity.pinAll(s, workers, workers.map((_, i) => cores[i % cores.length]));
       });
+      const mark = async stage => {
+        report.progress = {profile, stage, at: new Date().toISOString()};
+        await save();
+        console.log(JSON.stringify({stage, ...report.active, file}));
+      };
       report.active = {profile, readSize};
-      await save();
-      console.log(JSON.stringify({stage: 'prepared', ...report.active, file}));
+      await mark('prepared');
       released = true;
+      await mark('signal-start');
       await events.signal(s, master);
+      await mark('signal-end');
+      await mark('join-start');
       await s.measure('join:' + profile, async () => {
         await native.joinAll(s, workers);
       });
+      await mark('join-end');
       const firstIpc = workers[0].calls.findIndex(step => step.kind === 'ipc');
       const origin = workers[0].results[firstIpc - 1], rows = [];
       const ipcSteps = workers.flatMap(worker => worker.calls.flatMap((step, index) =>

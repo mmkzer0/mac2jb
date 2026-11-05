@@ -35,6 +35,9 @@ if (mode === 'ready-uncertain') {
 } else if (mode === 'ready') {
   emit({...report, memoryControl: {ready: true, socketPath: path.join(root, 'sock')}, retained: {threads: [], handles: []}});
   setInterval(() => {}, 1000);
+} else if (mode === 'progress') {
+  emit({...report, memoryControl: {ready: false}, progress: {stage: 'signal-start'}});
+  process.exit(0);
 } else {
   process.exit(0);
 }
@@ -107,4 +110,10 @@ test('ready report publishes ownership and returns', async () => {
   assert.equal(current.session, SESSION);
   assert.equal(current.report, path.join(root, 'attempt.json'));
   await result.abandon();
+});
+
+test('a failed attempt reports its last wave stage', async () => {
+  const {root, run} = await start('progress');
+  await assert.rejects(run, /last stage: signal-start/);
+  assert.equal(await spawnCount(root), 1);
 });
