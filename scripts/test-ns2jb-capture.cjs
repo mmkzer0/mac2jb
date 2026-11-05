@@ -47,6 +47,8 @@ test('all result tables survive an IPC-reserved reply', async () => {
   assert.ok(capture.results.every(result => result.status === 'read'));
   assert.equal(capture.replies[0].status, 'ipc-reserved');
   assert.equal(capture.replies[0].region.ipcReferences, 1);
+  assert.equal(capture.replies[0].worker, 'w0');
+  assert.equal(capture.replies[0].name, 'Commit');
   assert.equal(capture.replies[0].hex, undefined);
   assert.ok(!s.reads.includes(RESERVED), 'the reserved page must not be read');
   assert.equal(capture.partial, false);

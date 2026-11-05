@@ -40,7 +40,8 @@ async function captureWorkers(s, workers, writePartial) {
   for (const range of reads) snapshot.results.push(await captureRange(s, range, false));
   if (writePartial) await writePartial(snapshot);
   for (let index = 0; index < replies.length; index++) {
-    snapshot.replies.push(await captureRange(s, replies[index], true));
+    const reply = replies[index];
+    snapshot.replies.push({...await captureRange(s, reply, true), worker: reply.worker, name: reply.name});
     if (writePartial && (index + 1) % 4 === 0) await writePartial(snapshot);
   }
   snapshot.partial = false;
