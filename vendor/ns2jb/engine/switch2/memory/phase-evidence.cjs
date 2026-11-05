@@ -243,6 +243,7 @@ function classifyRunOutcome(report, events = []) {
   else if (error.includes('Native batch did not terminate')) category = 'native-worker-stall';
   else if (error.includes('Overwrite missed the qualified canary')) category = 'canary-overwrite-missed';
   else if (error.includes('socket hang up') || error.includes('ECONNRESET')) category = 'transport-disconnected';
+  else if (report?.completed && !markerReproduced && !error) category = 'canary-not-qualified';
   else if (!report?.completed && !error) category = 'host-stage-timeout';
 
   let stalledWorkerIndex = null;

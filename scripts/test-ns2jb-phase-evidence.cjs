@@ -332,4 +332,13 @@ test('classifyRunOutcome separates worker stalls, heap drift, alias misses, and 
   });
   assert.equal(aliasMiss.category, 'alias-not-selected');
   assert.equal(aliasMiss.substage, 'alias-read');
+
+  const canaryExhausted = classifyRunOutcome({
+    completed: true,
+    markerSelected: false,
+    markerReproduced: false,
+    cleanedUp: true
+  });
+  assert.equal(canaryExhausted.category, 'canary-not-qualified');
+  assert.equal(canaryExhausted.substage, 'canary-select');
 });
