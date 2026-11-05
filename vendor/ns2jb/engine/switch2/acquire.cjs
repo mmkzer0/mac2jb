@@ -82,7 +82,8 @@ async function start(options = {}) {
         if (exited || spawnError || Date.now() >= deadline) {
           const latest = reportFile ? await read(reportFile).catch(() => null) : null;
           const progress = latest?.progress?.stage ? ' (last stage: ' + latest.progress.stage + ')' : '';
-          throw Error('FS acquisition did not complete' + progress + '. Inspect ' + logFile +
+          const cause = latest?.error ? ': ' + String(latest.error).split('\n')[0].slice(0, 240) : '';
+          throw Error('FS acquisition did not complete' + cause + progress + '. Inspect ' + logFile +
             '; restart the console before another launch.');
         }
         if (report?.progress?.stage) {

@@ -121,6 +121,12 @@ test('native-batch failure: one attempt, no retry, no scratch cleanup', async ()
   assert.equal(await spawnCount(root), 1);
 });
 
+test('a terminated child error is surfaced in the supervisor message', async () => {
+  const {root, run} = await start('connected-error');
+  await assert.rejects(run, /FS acquisition did not complete: Native batch did not terminate/);
+  assert.equal(await spawnCount(root), 1);
+});
+
 test('child exits before provenance: one attempt, terminal', async () => {
   const {root, run} = await start('silent');
   await assert.rejects(run, /FS acquisition did not complete/);
