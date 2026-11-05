@@ -9,7 +9,7 @@ const {RunControl, StopRequested, reportWriter} = require("./run-control.cjs");
 const {packPages} = require("./session-tools.cjs");
 const {paths, pathPacket, pathPackets} = require("./paths.cjs");
 const normalizedPath = require("./normalized-path.cjs");
-const {hasWindow, summarize} = require("./phase-evidence.cjs");
+const {hasWindow, summarize, summarizeCopyStep, classifyAliasObservation} = require("./phase-evidence.cjs");
 const {packet, response} = require("../../shared/ipc.cjs");
 const functions = require("../../shared/sdk-functions.json");
 
@@ -665,11 +665,13 @@ async function main() {
             bytes.write('/..\\');
             tail.copy(bytes, markerOffset);
             bytes[bytes.length - 1] = 0;
+            const stepRows = [];
             for (let batch = 0; batch < 3; batch++) {
               let confirmed = 0, attempts = 0, bestMargin = -Infinity, aborted = 0, misses = 0;
               const guards = {completed: 0, earlyHole: 0, minimumSpacing: 0};
               for (let attempt = 0; attempt < requiredCopies * 20 && confirmed < requiredCopies; attempt++) {
                 const row = await wave('cache-' + name + '-' + batch + '-' + attempt, qualified, bytes);
+                stepRows.push(row);
                 attempts++;
                 if (Number.isFinite(row.receiveOrderMarginUs)) bestMargin = Math.max(bestMargin, row.receiveOrderMarginUs);
                 if (row.triggerAborted) {
@@ -684,13 +686,18 @@ async function main() {
                 const accepted = hasWindow(row) && row.preReleaseUsed >= minimumCacheHeld && row.changedPaths.length === 0;
                 if (accepted) confirmed++;
               }
-              if (confirmed === requiredCopies) break;
+              if (confirmed === requiredCopies) {
+                const summary = summarizeCopyStep(name, stepRows, requiredCopies, minimumCacheHeld);
+                (cache.copySteps ||= []).push(summary);
+                return summary;
+              }
               check(runControl.state.mode !== 'retiring', 'Cleanup field copies did not retain the required receive order');
               if (batch < 2) {
                 console.log(JSON.stringify({stage: 'field-copy-retry', name, batch, confirmed,
                   required: requiredCopies, attempts}));
                 continue;
               }
+              (cache.copySteps ||= []).push(summarizeCopyStep(name, stepRows, requiredCopies, minimumCacheHeld));
               throw Error('Field copy did not qualify within its attempt limit: ' + name +
                 ' [batch ' + batch + ', accepted ' + confirmed + '/' + requiredCopies +
                 ', attempts ' + attempts + ', best margin ' +
@@ -714,7 +721,9 @@ async function main() {
             const steps = canonicalPlanner.nulWrites(prefix);
             check(steps.length === 7, 'Combined prefix needs exactly seven copies');
             cache.combinedPrefix = prefix.toString('hex');
-            for (const step of steps) await copyField(step.bytes, name + '-' + step.end);
+            const copySteps = [];
+            for (const step of steps) copySteps.push(await copyField(step.bytes, name + '-' + step.end));
+            return copySteps;
           }
           const restoreAlias = async () => {
             {
@@ -744,21 +753,28 @@ async function main() {
             }
             cacheNeedsRestore = true;
             await save();
-            await installCombinedLeak('combined-leak-' + attempt);
+            const copySteps = await installCombinedLeak('combined-leak-' + attempt);
             const aliased = await readStorage(candidateHandle, 16, aliasOffset);
+            const observation = classifyAliasObservation({
+              aliased,
+              primeBytes: prime.bytes,
+              aliasControlBytes: aliasControl.bytes,
+              outputPoison: cache.outputPoison
+            });
             cache.readResult = aliased.result;
-            cache.selectedAlias = cache.normalContent = false;
+            cache.selectedAlias = observation.selectedAlias;
+            cache.normalContent = observation.normalContent;
+            cache.classification = observation.classification;
             cache.outputFile = cache.outputSha256 = cache.observedHex = null;
             if (aliased.bytes) {
               cache.outputFile = path.join(__dirname, label + '-alias-output-' + attempt + '.bin');
               await fs.writeFile(cache.outputFile, aliased.bytes, {mode: 0o600});
               cache.outputSha256 = hash(aliased.bytes);
               cache.observedHex = aliased.bytes.toString('hex');
-              cache.selectedAlias = aliased.bytes.equals(prime.bytes);
-              cache.normalContent = aliased.bytes.equals(aliasControl.bytes);
             }
             cache.attempts.push({attempt, result: aliased.result, observedHex: aliased.bytes?.toString('hex'),
               selectedAlias: cache.selectedAlias, normalContent: cache.normalContent,
+              classification: observation.classification, observation, copySteps,
               outputFile: aliased.bytes ? cache.outputFile : null});
             await save();
             // Keep this exact entry and buffer for the extended read. An
