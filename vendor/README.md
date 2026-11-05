@@ -23,8 +23,17 @@ source files. Root `LICENSE` does not override third-party terms.
   (provider retain, worker join, user-client provider release) were fixed.
 - ns2jb: the `BermTheSequel/ns2jb2` fork, based on pepsipu's
   original project, replaces the previous runtime. Its complete snapshot and
-  tests are pinned in `upstream.lock`. All runtime, exploit, and test files are
-  unchanged. `SHA256SUMS` is regenerated over the actual snapshot because the
+  tests are pinned in `upstream.lock`. One downstream hardening (2026-11-05)
+  applies to `engine/switch2/acquire.cjs` and the reserved-gap memory helpers
+  (`memory/phase-evidence.cjs`, `memory/probe-reserved-gap.cjs`,
+  `memory/capture-workers.cjs`): the acquisition supervisor is fail-closed
+  (single attempt, no pre-retry scratch cleanup, no substring retry filter, and
+  lifecycle revalidation before ownership is published); positive-phase
+  uncertainty is decided over the whole phase instead of its last row; and
+  worker capture isolates each read and persists result tables before any reply
+  read. Exploit geometry, payload bytes, worker roles, marker offsets, delays,
+  and read sizes are unchanged. `SHA256SUMS` is regenerated over the actual
+  snapshot because the
   fork's supplied manifest is retained separately. Its original
   manifest is retained in `packaging/ns2jb-8461942-SHA256SUMS.upstream`.
   `assets/bootstrap.bas` is copied byte for byte from the fork, including its

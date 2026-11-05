@@ -9,6 +9,7 @@ const {RunControl, StopRequested, reportWriter} = require("./run-control.cjs");
 const {packPages} = require("./session-tools.cjs");
 const {paths, pathPacket, pathPackets} = require("./paths.cjs");
 const normalizedPath = require("./normalized-path.cjs");
+const {hasWindow, summarize} = require("./phase-evidence.cjs");
 const {packet, response} = require("../../shared/ipc.cjs");
 const functions = require("../../shared/sdk-functions.json");
 
@@ -52,7 +53,9 @@ async function main() {
   const report = {session: live.session, scratch, canary, extent, markerOffset,
     probeReadSize, trialRange, cacheReadSize, fragmentCount, minimumCacheHeld,
     metadataAttempts, fieldCopies, waveAttempts, plannerCycle,
-    started: new Date().toISOString(), cases: []};
+    started: new Date().toISOString(), cases: [],
+    placementUncertain: false, canaryChanged: false, markerSelected: false,
+    markerReproduced: false, stopped: false, retryPhases: []};
   let saved, temporary, root, fileHandle, group, pinHandle, candidateHandle, originalRom, released = false;
   let cacheNeedsRestore = false, restoreCandidate;
   let addressPlan;
@@ -517,24 +520,39 @@ async function main() {
       return row;
     }
 
-    const hasWindow = row => row.restored && !row.triggerAborted && row.allPending && row.receiveOrderMarginUs >= 300 &&
-      row.preReleaseUsed >= 0x2600;
+    let positivePhases = 0;
     async function retryWave(profile) {
-      let row;
-      for (let attempt = 0; attempt < waveAttempts; attempt++) {
-        row = await wave(profile, probeReadSize);
-        if (!hasWindow(row)) continue;
-        if (profile === 'extent-present' && !row.selectedMarker) continue;
-        if (profile === 'positive') {
-          const matched = row.canaryType === 0 && row.changedPaths.every(name => name === 'canary');
-          if (!matched && attempt < waveAttempts - 1) continue;
-        } else if (profile === 'address-encoding-control') {
-          if (row.canaryResult === 0 && row.canaryType === 1 &&
-              row.changedPaths.every(name => ['filler0', 'filler1', 'guard0', 'guard1'].includes(name))) continue;
+      const firstCase = report.cases.length;
+      let row, complete = false;
+      try {
+        for (let attempt = 0; attempt < waveAttempts; attempt++) {
+          row = await wave(profile, probeReadSize);
+          if (!hasWindow(row)) continue;
+          if (profile === 'extent-present' && !row.selectedMarker) continue;
+          if (profile === 'positive') {
+            const matched = row.canaryType === 0 && row.changedPaths.every(name => name === 'canary');
+            if (!matched && attempt < waveAttempts - 1) continue;
+          } else if (profile === 'address-encoding-control') {
+            if (row.canaryResult === 0 && row.canaryType === 1 &&
+                row.changedPaths.every(name => ['filler0', 'filler1', 'guard0', 'guard1'].includes(name))) continue;
+          }
+          break;
         }
-        break;
+        complete = true;
+        return row;
+      } finally {
+        const phase = summarize(profile, report.cases.slice(firstCase), complete);
+        report.retryPhases.push(phase);
+        report.canaryChanged ||= phase.canaryChanged;
+        if (profile === 'positive') {
+          if (complete && phase.markerObserved) {
+            if (positivePhases === 0) report.markerSelected = true;
+            else if (positivePhases === 1) report.markerReproduced = true;
+          }
+          positivePhases++;
+          if (phase.unsafe) report.placementUncertain = true;
+        }
       }
-      return row;
     }
     async function checkExtent() {
       const row = await retryWave('extent-present');
@@ -568,27 +586,19 @@ async function main() {
     if (qualified) {
       const control = await retryWave('negative');
       if (hasWindow(control)) {
-        const positive = await retryWave('positive');
-        report.canaryChanged = positive.changedPaths.includes('canary') && positive.allPending &&
-          positive.receiveOrderMarginUs >= 300;
-        report.markerSelected = (report.canaryChanged) && positive.canaryType === 0 &&
-          positive.changedPaths.every(name => name === 'canary') && hasWindow(positive);
-        if ((!positive.triggerAborted) && !report.markerSelected) {
-          report.placementUncertain = true;
+        await retryWave('positive');
+        if (report.placementUncertain && !report.markerSelected) {
           await save();
-          throw Error('Overwrite missed the qualified canary; retain resources for recovery');
+          throw Error('Positive phase contains an uncertain overwrite; retain resources for recovery');
         }
         // The locator already traversed and checked the full input extent.
         // Keep its allocation sequence intact through the directory controls.
         await checkExtent();
         if ((report.markerSelected)) {
-          const repeated = await retryWave('positive');
-          report.markerReproduced = repeated.canaryType === 0 &&
-            repeated.changedPaths.every(name => name === 'canary') && hasWindow(repeated);
-          if (!repeated.triggerAborted && !report.markerReproduced) {
-            report.placementUncertain = true;
+          await retryWave('positive');
+          if (report.placementUncertain && !report.markerReproduced) {
             await save();
-            throw Error('Repeated overwrite missed the canary; retain resources for recovery');
+            throw Error('Repeated positive phase contains an uncertain overwrite; retain resources for recovery');
           }
           await checkExtent();
         }
@@ -1080,9 +1090,13 @@ async function main() {
       if (runControl.started && await s.ready()) {
         if (s.threads.size && workers.length) {
           try {
-            const capture = await require("./capture-workers.cjs").captureWorkers(s, workers);
             report.workerCaptureFile = path.join(__dirname, label + '-worker-failure.json');
-            await fs.writeFile(report.workerCaptureFile, JSON.stringify(capture, null, 2) + '\n', {mode: 0o600});
+            const writeCapture = async value => {
+              await fs.writeFile(report.workerCaptureFile,
+                JSON.stringify(value, null, 2) + '\n', {mode: 0o600});
+            };
+            const capture = await require("./capture-workers.cjs").captureWorkers(s, workers, writeCapture);
+            await writeCapture(capture);
           } catch (captureError) {report.workerCaptureError = captureError.stack;}
           await save();
         }

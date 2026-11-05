@@ -10,17 +10,12 @@ const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 // The acquisition owns native allocations until retire() completes.
 async function start() {
-  // This is flaky right now, so run 3x for now
-  const MAX_ATTEMPTS = 3;
+  // Fail closed: one attempt only. A retry after an unsafe attempt starts a new
+  // session or runs cleanup-scratch on a wedged FS session, which can block the
+  // main thread for minutes.
+  const MAX_ATTEMPTS = 1;
   let lastError;
   for (let attempt = 0; attempt < MAX_ATTEMPTS; ++attempt) {
-    if (attempt > 0) {
-      try {
-        await require('./cleanup-scratch.cjs').main();
-      } catch {
-        // Continue if session or cleanup was transiently unavailable
-      }
-    }
     const logFile = path.join(__dirname, 'acquisition.log');
 
     if (attempt === 0) {
@@ -74,16 +69,30 @@ async function start() {
           throw Error('FS acquisition did not complete. Inspect ' + logFile + '; restart the console before another launch.');
         await delay(500);
       }
-      if (report.session !== a.session || report.error || report.cleanupError)
-        throw Error('FS acquisition has an error or belongs to another session');
+      const publishable = async () => {
+        const latest = await read(reportFile);
+        if (latest.session !== a.session || latest.memoryControl?.ready !== true ||
+            latest.error || latest.cleanupError || latest.cacheRestoreError ||
+            latest.placementUncertain || latest.stopped || exited || spawnError ||
+            Date.now() >= deadline)
+          throw Error('FS acquisition lost lifecycle authority before publication');
+        return latest;
+      };
+      if (report.session !== a.session || report.error || report.cleanupError ||
+          report.cacheRestoreError || report.placementUncertain || report.stopped)
+        throw Error('FS acquisition is unsafe, closed, or belongs to another session');
       const proof = await verifyProof(reportFile, a.session);
+      // Saved proof is not a liveness check: revalidate authority at each publication.
+      await publishable();
       const supervisorReport = path.join(__dirname, 'acquisition-supervisor.json');
       await save(supervisorReport, { stage: 'memory-ready', attempts: [{ report: reportFile }] });
+      const published = await publishable();
       const current = {
         session: a.session, report: reportFile, supervisorReport,
-        socketPath: report.memoryControl.socketPath, proof, finished: new Date().toISOString()
+        socketPath: published.memoryControl.socketPath, proof, finished: new Date().toISOString()
       };
       await save(path.join(__dirname, 'current-acquisition.json'), current);
+      await publishable();
       return {
         ...current, abandon,
         async retire() {
@@ -109,13 +118,7 @@ async function start() {
     } catch (error) {
       await abandon();
       lastError = error;
-      const report = reportFile ? await read(reportFile).catch(() => null) : null;
-      if (report?.error?.includes('timed out') || error.message.includes('timed out') ||
-          report?.error?.includes('connection is not ready') || error.message.includes('connection is not ready')) {
-        break;
-      }
     }
-    if (attempt < MAX_ATTEMPTS - 1) await delay(1000);
   }
   throw lastError;
 }
