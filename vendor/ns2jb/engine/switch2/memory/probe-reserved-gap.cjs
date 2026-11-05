@@ -430,12 +430,14 @@ async function main() {
         await native.joinAll(s, workers);
       });
       await mark('join-end');
+      await mark('replies-start');
       const firstIpc = workers[0].calls.findIndex(step => step.kind === 'ipc');
       const origin = workers[0].results[firstIpc - 1], rows = [];
       const ipcSteps = workers.flatMap(worker => worker.calls.flatMap((step, index) =>
         step.kind === 'ipc' ? [{worker, step, index}] : []));
       const replies = (await s.measure('replies:' + profile, () =>
         s.readOwnedMany(ipcSteps.map(({step}) => ({address: step.args[0], bytes: 256})))));
+      await mark('replies-end');
       for (const [replyIndex, {worker, index, step}] of ipcSteps.entries()) {
         check(worker.results[index] === 0n, 'Native gap transport failed at ' + step.name);
         const bytes = (replies[replyIndex]);

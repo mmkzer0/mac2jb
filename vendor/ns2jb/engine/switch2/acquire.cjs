@@ -2,14 +2,28 @@ const fs = require('node:fs');
 const path = require('node:path');
 const readline = require('node:readline');
 const { spawn } = require('node:child_process');
+const { performance } = require('node:perf_hooks');
 const { a } = require('../shared/rpc.cjs');
 const { request } = require('./tools/endpoint.cjs');
 const { verifyProof } = require('./memory/verify-proof.cjs');
 const { save, read } = require('./ro/runtime.cjs');
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 
+// A wave that stops advancing while it is inside a blocking await is stalled.
+// The host detects this from the report with its own monotonic clock and never
+// issues an RPC while the console's request path may still be occupied.
+// `signal-start`, `join-start` and `replies-start` arm the window: each marker
+// is written immediately before a blocking native await, and the next marker
+// proves that the await returned. The post-join reply read is included because
+// a hang there has no other progress marker. Remaining inter-wave work keeps
+// the previous marker and is bounded by the global acquisition deadline.
+const STALL_MS = 60 * 1000;
+const DEADLINE_MS = 25 * 60 * 1000;
+const ARMED_STAGES = new Set(['signal-start', 'join-start', 'replies-start']);
+
 // The acquisition owns native allocations until retire() completes.
-async function start() {
+async function start(options = {}) {
+  const stallMs = Number.isFinite(options.stallMs) ? options.stallMs : STALL_MS;
   // Fail closed: one attempt only. A retry after an unsafe attempt starts a new
   // session or runs cleanup-scratch on a wedged FS session, which can block the
   // main thread for minutes.
@@ -47,8 +61,8 @@ async function start() {
       await done;
     };
     try {
-      const deadline = Date.now() + 10 * 60 * 1000;
-      let report, recorded = false;
+      const deadline = Date.now() + DEADLINE_MS;
+      let report, recorded = false, armedKey = null, armedSince = 0;
 // AFTER in acquire.cjs
       for (; ;) {
         if (reportFile) {
@@ -70,6 +84,18 @@ async function start() {
           const progress = latest?.progress?.stage ? ' (last stage: ' + latest.progress.stage + ')' : '';
           throw Error('FS acquisition did not complete' + progress + '. Inspect ' + logFile +
             '; restart the console before another launch.');
+        }
+        if (report?.progress?.stage) {
+          const key = report.progress.profile + ':' + report.progress.stage + ':' + report.progress.at;
+          if (key !== armedKey) {
+            armedKey = key;
+            armedSince = performance.now();
+          }
+          if (ARMED_STAGES.has(report.progress.stage) && performance.now() - armedSince > stallMs)
+            throw Error('FS acquisition stalled (WAVE_STALLED) at ' + report.progress.profile + ':' +
+              report.progress.stage + '; no progress for ' + Math.round((performance.now() - armedSince) / 1000) +
+              ' s. The worker state is unknown; do not release or reuse this session. Inspect ' +
+              logFile + '; restart the console before another launch.');
         }
         await delay(500);
       }
@@ -127,4 +153,4 @@ async function start() {
   throw lastError;
 }
 
-module.exports = { start };
+module.exports = { start, DEADLINE_MS };
