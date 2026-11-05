@@ -687,7 +687,8 @@ async function main() {
                 if (accepted) confirmed++;
               }
               if (confirmed === requiredCopies) {
-                const summary = summarizeCopyStep(name, stepRows, requiredCopies, minimumCacheHeld);
+                const summary = summarizeCopyStep(name, stepRows, requiredCopies, minimumCacheHeld,
+                  {qualified: true, confirmedBatch: batch});
                 (cache.copySteps ||= []).push(summary);
                 return summary;
               }
@@ -697,7 +698,8 @@ async function main() {
                   required: requiredCopies, attempts}));
                 continue;
               }
-              (cache.copySteps ||= []).push(summarizeCopyStep(name, stepRows, requiredCopies, minimumCacheHeld));
+              (cache.copySteps ||= []).push(summarizeCopyStep(name, stepRows, requiredCopies, minimumCacheHeld,
+                {qualified: false, confirmedBatch: null}));
               throw Error('Field copy did not qualify within its attempt limit: ' + name +
                 ' [batch ' + batch + ', accepted ' + confirmed + '/' + requiredCopies +
                 ', attempts ' + attempts + ', best margin ' +

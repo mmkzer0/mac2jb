@@ -25,7 +25,7 @@ function summarize(profile, rows, complete) {
   };
 }
 
-function summarizeCopyStep(name, rows, requiredCopies, minimumCacheHeld = 0x2810) {
+function summarizeCopyStep(name, rows, requiredCopies, minimumCacheHeld = 0x2810, options = {}) {
   const isAccepted = row =>
     hasWindow(row) && row.preReleaseUsed >= minimumCacheHeld && row.changedPaths.length === 0;
   const acceptedRows = rows.filter(isAccepted);
@@ -38,15 +38,20 @@ function summarizeCopyStep(name, rows, requiredCopies, minimumCacheHeld = 0x2810
   const guards = {completed: 0, earlyHole: 0, minimumSpacing: 0};
   for (const row of rows) if (row.triggerAborted)
     for (const key of Object.keys(guards)) if (row.nativeGuard?.[key]) guards[key]++;
+  const qualified = typeof options.qualified === 'boolean'
+    ? options.qualified
+    : acceptedRows.length >= requiredCopies;
   return {
     name,
     required: requiredCopies,
     attempts: rows.length,
     accepted: acceptedRows.length,
-    qualified: acceptedRows.length >= requiredCopies,
+    qualified,
+    confirmedBatch: options.confirmedBatch ?? (qualified ? 0 : null),
     aborted: rows.filter(row => row.triggerAborted).length,
     unabortedRejected,
     lowPreReleaseRejected,
+    unverifiedMemoryEffect: unabortedRejected > 0,
     canaryMisses: rows.filter(row => row.changedPaths.length > 0).length,
     guards,
     bestMarginUs: margins.length ? Math.max(...margins) : null,
@@ -74,7 +79,7 @@ function classifyAliasObservation({aliased, primeBytes, aliasControlBytes, outpu
     };
   }
   const selectedAlias = bytes.equals(primeBytes);
-  const normalContent = bytes.equals(aliasControlBytes);
+  const normalContent = !selectedAlias && bytes.equals(aliasControlBytes);
   let poisonBytes = 0, zeroBytes = 0, primeMatchingBytes = 0, normalMatchingBytes = 0;
   let firstDiffFromPrime = -1, firstDiffFromNormal = -1;
   for (let i = 0; i < bytes.length; i++) {
@@ -85,13 +90,15 @@ function classifyAliasObservation({aliased, primeBytes, aliasControlBytes, outpu
     if (i < aliasControlBytes.length && bytes[i] === aliasControlBytes[i]) normalMatchingBytes++;
     else if (firstDiffFromNormal === -1) firstDiffFromNormal = i;
   }
-  const untouchedPoison = poisonBytes === bytes.length;
-  const zeroFilled = zeroBytes === bytes.length;
+  const untouchedPoison = !selectedAlias && !normalContent && poisonBytes === bytes.length;
+  const zeroFilled = !selectedAlias && !normalContent && !untouchedPoison && zeroBytes === bytes.length;
+  const partialPrimePrefix = !selectedAlias && !normalContent && !untouchedPoison && !zeroFilled &&
+    firstDiffFromPrime >= 4;
   const classification = selectedAlias ? 'selected-alias'
     : normalContent ? 'ordinary-backing-read'
     : untouchedPoison ? 'untouched-receive-buffer'
-    : (primeMatchingBytes > 0 && firstDiffFromPrime > 0) ? 'partial-prime-prefix'
     : zeroFilled ? 'zero-filled'
+    : partialPrimePrefix ? 'partial-prime-prefix'
     : 'unexpected-content';
   return {
     classification,

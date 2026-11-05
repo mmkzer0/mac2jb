@@ -60,19 +60,27 @@ test('summarizeCopyStep aggregates accepted windows, guards, and margins', () =>
     row({receiveOrderMarginUs: 600, preReleaseUsed: 0x2810}),
     row({receiveOrderMarginUs: 380, preReleaseUsed: 0x2a00})
   ];
-  const summary = summarizeCopyStep('combined-leak-0-17', rows, 2, 0x2810);
+  const summary = summarizeCopyStep('combined-leak-0-17', rows, 2, 0x2810, {qualified: true, confirmedBatch: 1});
   assert.equal(summary.qualified, true);
+  assert.equal(summary.confirmedBatch, 1);
   assert.equal(summary.attempts, 5);
   assert.equal(summary.accepted, 2);
   assert.equal(summary.aborted, 1);
   assert.equal(summary.unabortedRejected, 2);
   assert.equal(summary.lowPreReleaseRejected, 1);
+  assert.equal(summary.unverifiedMemoryEffect, true);
   assert.equal(summary.canaryMisses, 1);
   assert.deepEqual(summary.guards, {completed: 1, earlyHole: 0, minimumSpacing: 0});
   assert.equal(summary.bestMarginUs, 600);
   assert.equal(summary.minAcceptedMarginUs, 380);
   assert.equal(summary.minAcceptedPreReleaseUsed, 0x2810);
   assert.equal(summary.maxAcceptedPreReleaseUsed, 0x2a00);
+
+  // Cross-batch split (1 accepted in batch 0 + 1 accepted in batch 1, none reaching required=2 in a single batch)
+  const failedSummary = summarizeCopyStep('combined-leak-0-17', rows, 2, 0x2810, {qualified: false, confirmedBatch: null});
+  assert.equal(failedSummary.accepted, 2);
+  assert.equal(failedSummary.qualified, false);
+  assert.equal(failedSummary.confirmedBatch, null);
 });
 
 test('summarizeCopyStep qualifies timing-only waves even when no metadata write landed', () => {
@@ -131,6 +139,27 @@ test('classifyAliasObservation distinguishes redirect, poison, partial prefix, a
   });
   assert.equal(partialObs.classification, 'partial-prime-prefix');
   assert.equal(partialObs.firstDiffFromPrime, 8);
+
+  // Exclusivity check: all-zero buffer when primeBytes starts with 0x00 must classify as zero-filled, not partial-prime-prefix
+  const zeroPrime = Buffer.from('002233445566778899aabbccddeeff00', 'hex');
+  const zeroObs = classifyAliasObservation({
+    aliased: {result: 0, bytes: Buffer.alloc(16, 0)},
+    primeBytes: zeroPrime,
+    aliasControlBytes
+  });
+  assert.equal(zeroObs.classification, 'zero-filled');
+  assert.equal(zeroObs.zeroFilled, true);
+  assert.equal(zeroObs.normalContent, false);
+
+  // Exclusivity check: if aliasControlBytes itself is all-zeros, ordinary-backing-read takes precedence over zeroFilled
+  const zeroBackingObs = classifyAliasObservation({
+    aliased: {result: 0, bytes: Buffer.alloc(16, 0)},
+    primeBytes,
+    aliasControlBytes: Buffer.alloc(16, 0)
+  });
+  assert.equal(zeroBackingObs.classification, 'ordinary-backing-read');
+  assert.equal(zeroBackingObs.normalContent, true);
+  assert.equal(zeroBackingObs.zeroFilled, false);
 
   const errObs = classifyAliasObservation({
     aliased: {result: 0x202, bytes: null},
