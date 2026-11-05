@@ -296,9 +296,11 @@ test('classifyRunOutcome separates worker stalls, heap drift, alias misses, and 
     linkCandidates: [],
     error: 'Error: The bounded native leak contains no qualified, encodable link candidate'
   });
+  assert.equal(t0a2cc.terminalCause, 'no-native-links');
+  assert.equal(t0a2cc.furthestStage, 'native-links');
+  assert.equal(t0a2cc.evidenceStatus, 'verified');
   assert.equal(t0a2cc.category, 'no-native-links');
   assert.equal(t0a2cc.substage, 'native-links');
-
   const bbunsz = classifyRunOutcome({
     markerSelected: true,
     markerReproduced: true,
@@ -317,12 +319,11 @@ test('classifyRunOutcome separates worker stalls, heap drift, alias misses, and 
     markerReproduced: false,
     error: 'Error: Native batch did not terminate; resources retained'
   }, stallEvents);
-  assert.equal(stallRepro.category, 'native-worker-stall');
-  assert.equal(stallRepro.substage, 'canary-reproduce');
-  assert.equal(stallRepro.stalledWorkerIndex, 0);
-  assert.equal(stallRepro.stalledWorkerRole, 'commit');
+  assert.equal(stallRepro.terminalCause, 'native-worker-stall');
+  assert.equal(stallRepro.furthestStage, 'canary-reproduce');
+  assert.equal(stallRepro.firstUnjoinedWorkerIndex, 0);
+  assert.equal(stallRepro.firstUnjoinedWorkerRole, 'commit');
   assert.equal(stallRepro.joinedBeforeStall, 0);
-
   const aliasMiss = classifyRunOutcome({
     markerSelected: true,
     markerReproduced: true,
@@ -341,4 +342,26 @@ test('classifyRunOutcome separates worker stalls, heap drift, alias misses, and 
   });
   assert.equal(canaryExhausted.category, 'canary-not-qualified');
   assert.equal(canaryExhausted.substage, 'canary-select');
+
+  // Orthogonal dimensions: a worker stall during address-plan must report terminalCause=native-worker-stall and furthestStage=address-plan
+  const stallInAddressPlan = classifyRunOutcome({
+    markerSelected: true,
+    markerReproduced: true,
+    cacheAlias: {selectedAlias: true, attempts: [{attempt: 0}]},
+    cacheRange: {completed: true},
+    linkCandidates: [{target: 0x123454000, encodable: true}],
+    cacheAddress: {completed: false},
+    error: 'Error: Native batch did not terminate; resources retained'
+  }, stallEvents);
+  assert.equal(stallInAddressPlan.furthestStage, 'address-plan');
+  assert.equal(stallInAddressPlan.terminalCause, 'native-worker-stall');
+  assert.equal(stallInAddressPlan.evidenceStatus, 'verified');
+
+  // Console response timed out during init
+  const initTimeout = classifyRunOutcome({
+    cases: [],
+    error: 'Error: Console response timed out: Prepare reserved-gap scratch'
+  });
+  assert.equal(initTimeout.furthestStage, 'init');
+  assert.equal(initTimeout.terminalCause, 'transport-disconnected');
 });

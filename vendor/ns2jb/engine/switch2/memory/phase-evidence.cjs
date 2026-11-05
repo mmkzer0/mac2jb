@@ -222,34 +222,51 @@ function classifyRunOutcome(report, events = []) {
   const markerReproduced = Boolean(report?.markerReproduced);
   const aliasAttempts = report?.cacheAlias?.attempts?.length ?? 0;
   const maxAttempts = report?.metadataAttempts ?? 4;
+  const casesCount = report?.cases?.length ?? 0;
 
-  let substage = 'canary-select';
-  if (addressCompleted || report?.ready) substage = 'completed';
-  else if (rangeCompleted && linkCount > 0) substage = 'address-plan';
-  else if (rangeCompleted) substage = 'native-links';
-  else if (selectedAlias) substage = 'cache-range';
-  else if (aliasAttempts >= maxAttempts) substage = 'alias-read';
-  else if (markerReproduced) substage = 'alias-copy';
-  else if (markerSelected) substage = 'canary-reproduce';
+  let furthestStage = 'canary-select';
+  if (addressCompleted && report?.ready && !error) furthestStage = 'completed';
+  else if (rangeCompleted && linkCount > 0) furthestStage = 'address-plan';
+  else if (rangeCompleted) furthestStage = 'native-links';
+  else if (selectedAlias) furthestStage = 'cache-range';
+  else if (aliasAttempts >= maxAttempts) furthestStage = 'alias-read';
+  else if (markerReproduced) furthestStage = 'alias-copy';
+  else if (markerSelected) furthestStage = 'canary-reproduce';
+  else if (casesCount === 0 && !report?.negativeControl?.completed && error) furthestStage = 'init';
 
-  let category = 'other-error';
-  if (report?.ready && addressCompleted) category = 'ready';
-  else if (rangeCompleted && linkCount > 0 && !addressCompleted) category = 'address-plan-failed';
-  else if (selectedAlias && rangeCompleted && linkCount === 0) category = 'no-native-links';
-  else if (selectedAlias && !rangeCompleted) category = 'cache-range-failed';
-  else if (!selectedAlias && aliasAttempts >= maxAttempts && error.includes('Clean alias did not qualify'))
-    category = 'alias-not-selected';
-  else if (error.includes('General-heap allocation changed')) category = 'general-heap-drift';
-  else if (error.includes('Native batch did not terminate')) category = 'native-worker-stall';
-  else if (error.includes('Overwrite missed the qualified canary')) category = 'canary-overwrite-missed';
-  else if (error.includes('socket hang up') || error.includes('ECONNRESET')) category = 'transport-disconnected';
-  else if (report?.completed && !markerReproduced && !error) category = 'canary-not-qualified';
-  else if (!report?.completed && !error) category = 'host-stage-timeout';
+  let terminalCause = 'other-error';
+  let evidenceStatus = 'verified';
+  if (report?.ready && addressCompleted && !error) terminalCause = 'ready';
+  else if (error.includes('Native batch did not terminate')) terminalCause = 'native-worker-stall';
+  else if (error.includes('General-heap allocation changed')) terminalCause = 'general-heap-drift';
+  else if (error.includes('socket hang up') || error.includes('ECONNRESET') || error.includes('Console response timed out'))
+    terminalCause = 'transport-disconnected';
+  else if (error.includes('The bounded native leak contains no qualified')) terminalCause = 'no-native-links';
+  else if (error.includes('Clean alias did not qualify')) terminalCause = 'alias-not-selected';
+  else if (error.includes('Field copy did not qualify')) terminalCause = 'field-copy-not-qualified';
+  else if (error.includes('Overwrite missed the qualified canary')) terminalCause = 'canary-overwrite-missed';
+  else if (rangeCompleted && linkCount > 0 && !addressCompleted) {
+    terminalCause = 'address-plan-failed';
+    evidenceStatus = error ? 'verified' : 'inferred';
+  } else if (selectedAlias && rangeCompleted && linkCount === 0) {
+    terminalCause = 'no-native-links';
+    evidenceStatus = error ? 'verified' : 'inferred';
+  } else if (selectedAlias && !rangeCompleted) {
+    terminalCause = 'cache-range-failed';
+    evidenceStatus = error ? 'verified' : 'inferred';
+  } else if (report?.completed && !markerReproduced && !error) {
+    terminalCause = 'canary-not-qualified';
+  } else if (!report?.completed && !error) {
+    terminalCause = 'host-stage-timeout';
+    evidenceStatus = 'inferred';
+  } else {
+    evidenceStatus = 'unknown';
+  }
 
-  let stalledWorkerIndex = null;
-  let stalledWorkerRole = null;
+  let firstUnjoinedWorkerIndex = null;
+  let firstUnjoinedWorkerRole = null;
   let joinedBeforeStall = null;
-  if (category === 'native-worker-stall' && Array.isArray(events) && events.length > 0) {
+  if (terminalCause === 'native-worker-stall' && Array.isArray(events) && events.length > 0) {
     let lastStart12 = -1;
     for (let i = events.length - 1; i >= 0; i--) {
       if (events[i]?.operation === 'workerStarted' && String(events[i]?.label ?? '').endsWith('-12')) {
@@ -260,20 +277,25 @@ function classifyRunOutcome(report, events = []) {
     if (lastStart12 !== -1) {
       const joined = events.slice(lastStart12 + 1).filter(e => e?.operation === 'workerJoined');
       joinedBeforeStall = joined.length;
-      stalledWorkerIndex = joined.length;
-      stalledWorkerRole = WORKER_ROLES[stalledWorkerIndex] ?? `worker-${stalledWorkerIndex}`;
+      firstUnjoinedWorkerIndex = joined.length;
+      firstUnjoinedWorkerRole = WORKER_ROLES[firstUnjoinedWorkerIndex] ?? `worker-${firstUnjoinedWorkerIndex}`;
     }
   }
   return {
-    category,
-    substage,
+    furthestStage,
+    terminalCause,
+    evidenceStatus,
+    category: terminalCause,
+    substage: furthestStage,
     markerSelected,
     markerReproduced,
     aliasAttempts,
     selectedAlias,
     rangeCompleted,
-    stalledWorkerIndex,
-    stalledWorkerRole,
+    firstUnjoinedWorkerIndex,
+    firstUnjoinedWorkerRole,
+    stalledWorkerIndex: firstUnjoinedWorkerIndex,
+    stalledWorkerRole: firstUnjoinedWorkerRole,
     joinedBeforeStall
   };
 }
