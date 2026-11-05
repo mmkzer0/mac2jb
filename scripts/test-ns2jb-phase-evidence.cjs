@@ -1,3 +1,4 @@
+const fs = require('node:fs');
 // Phase-evidence truth table. Pure function, no console, no repository writes.
 const test = require('node:test');
 const assert = require('node:assert');
@@ -211,9 +212,51 @@ test('summarizeRangeLeak forms a mutually exclusive block partition and separate
     otherBinary: 1
   });
   assert.equal(forensics.overReadBlockHeadsInRange, 1);
+  assert.deepEqual(forensics.independentCounts, {
+    asciiHeavyBlocks: 2,
+    pointerBearingBlocks: 1,
+    uniqueOutHashes: 7
+  });
   assert.equal(forensics.overReadBlockHeads16kAligned, 1);
   assert.equal(forensics.overReadRawPointersTotal, 2);
   assert.equal(forensics.overReadRawPointers16kAligned, 1);
   assert.equal(forensics.qualifiedLinkCandidates, 1);
   assert.equal(forensics.encodableLinkCandidates, 1);
+});
+
+test('summarizeRangeLeak matches conserved T0a2CC hardware over-read dump when present', t => {
+  const dir = '/Users/lennartk/private/mac2jb-s3/20261105-switch2-T0a2CC-alias-pass/switch2/memory';
+  const outPath = path.join(dir, 'reserved-gap-1793893081989-range-output.bin');
+  const ctrlPath = path.join(dir, 'reserved-gap-1793893081989-range-control.bin');
+  if (!fs.existsSync(outPath) || !fs.existsSync(ctrlPath)) {
+    t.skip('Private T0a2CC hardware dump not present on this machine');
+    return;
+  }
+  const widened = fs.readFileSync(outPath);
+  const control = fs.readFileSync(ctrlPath);
+  const forensics = summarizeRangeLeak(widened, control, []);
+  assert.equal(forensics.totalBlocks, 128);
+  const sum = Object.values(forensics.partition).reduce((a, b) => a + b, 0);
+  assert.equal(sum, 128);
+  assert.deepEqual(forensics.partition, {
+    matchesControlSameOffset: 1,
+    matchesControlOtherOffset: 0,
+    exactDuplicateBlocks: 3,
+    zeroFilled: 0,
+    poisonFilled: 0,
+    pointerBearing: 1,
+    asciiHeavy: 81,
+    otherBinary: 42
+  });
+  assert.deepEqual(forensics.independentCounts, {
+    asciiHeavyBlocks: 82,
+    pointerBearingBlocks: 1,
+    uniqueOutHashes: 125
+  });
+  assert.equal(forensics.overReadBlockHeadsInRange, 0);
+  assert.equal(forensics.overReadBlockHeads16kAligned, 0);
+  assert.equal(forensics.overReadRawPointersTotal, 2);
+  assert.equal(forensics.overReadRawPointers16kAligned, 0);
+  assert.equal(forensics.qualifiedLinkCandidates, 0);
+  assert.equal(forensics.encodableLinkCandidates, 0);
 });

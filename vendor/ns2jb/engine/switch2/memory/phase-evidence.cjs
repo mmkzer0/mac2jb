@@ -137,6 +137,11 @@ function summarizeRangeLeak(widenedBytes, controlBytes, linkCandidates = [], out
     asciiHeavy: 0,
     otherBinary: 0
   };
+  const independentCounts = {
+    asciiHeavyBlocks: 0,
+    pointerBearingBlocks: 0,
+    uniqueOutHashes: 0
+  };
   let overReadBlockHeadsInRange = 0;
   let overReadBlockHeads16kAligned = 0;
   let overReadRawPointersTotal = 0;
@@ -157,20 +162,26 @@ function summarizeRangeLeak(widenedBytes, controlBytes, linkCandidates = [], out
       if ((b >= 0x20 && b <= 0x7e) || b === 0x0a || b === 0x0d || b === 0x09) ascii++;
     }
     for (let i = 0; i + 8 <= slice.length; i += 8) {
-      const v = slice.readBigUInt64LE(i);
-      const inRange = v >= 0x100000000n && v < (1n << 39n) && (v & 0xffffffn) !== 0n;
-      if (idx >= 1 && i === 0 && inRange) {
+      const hi = slice.readUInt32LE(i + 4);
+      if (hi < 1 || hi >= 0x80) continue;
+      const lo = slice.readUInt32LE(i);
+      if ((lo & 0xffffff) === 0) continue;
+      if (idx >= 1 && i === 0) {
         overReadBlockHeadsInRange++;
-        if (v % 0x4000n === 0n) overReadBlockHeads16kAligned++;
+        if ((lo & 0x3fff) === 0) overReadBlockHeads16kAligned++;
       }
-      if (inRange && (v & 7n) === 0n) {
+      if ((lo & 7) === 0) {
         blockPtrs++;
         if (idx >= 1) {
           overReadRawPointersTotal++;
-          if (v % 0x4000n === 0n) overReadRawPointers16kAligned++;
+          if ((lo & 0x3fff) === 0) overReadRawPointers16kAligned++;
         }
       }
     }
+    if (ascii > blockSize / 2) independentCounts.asciiHeavyBlocks++;
+    if (blockPtrs > 0) independentCounts.pointerBearingBlocks++;
+
+    // Priority-ordered mutually exclusive partition:
     const ctrlMatch = ctrlBlocks.get(h);
     if (ctrlMatch && ctrlMatch.includes(idx)) partition.matchesControlSameOffset++;
     else if (ctrlMatch) partition.matchesControlOtherOffset++;
@@ -181,10 +192,12 @@ function summarizeRangeLeak(widenedBytes, controlBytes, linkCandidates = [], out
     else if (ascii > blockSize / 2) partition.asciiHeavy++;
     else partition.otherBinary++;
   }
+  independentCounts.uniqueOutHashes = seenOutHashes.size;
   return {
     blockSize,
     totalBlocks,
     partition,
+    independentCounts,
     overReadBlockHeadsInRange,
     overReadBlockHeads16kAligned,
     overReadRawPointersTotal,

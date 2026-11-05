@@ -870,7 +870,6 @@ async function main() {
               range.outputSha256 = hash(widened.bytes);
               range.firstDifference = widened.bytes.findIndex((byte, i) => byte !== control.bytes[i]);
               range.prefixMatches = widened.bytes.subarray(0, 0x4000).equals(control.bytes.subarray(0, 0x4000));
-              range.forensics = summarizeRangeLeak(widened.bytes, control.bytes, [], range.outputPoison);
             }
             await save();
             if ((widened.bytes) && range.prefixMatches && range.firstDifference >= 0x4000) {
@@ -921,6 +920,9 @@ async function main() {
               }
             }
             await restoreCandidate();
+            if (widened.bytes) {
+              range.forensics = summarizeRangeLeak(widened.bytes, control.bytes, [], range.outputPoison);
+            }
             range.completed = true;
           }
           if ((cache.selectedAlias)) {
