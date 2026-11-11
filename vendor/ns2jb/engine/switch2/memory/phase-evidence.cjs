@@ -227,8 +227,8 @@ function classifyRunOutcome(report, events = []) {
   const canaryTypeZeroWaves = positiveWaves.filter(row => row?.canaryType === 0).length;
   // A type-0 observation is weaker than a qualified marker hit: the marker also
   // needs the qualified window and unchanged path set.
-  const canaryMarkerHits = positiveWaves.filter(row =>
-    hasWindow(row) && markerObserved(row)).length;
+  // markerObserved already requires the qualified window.
+  const canaryMarkerHits = positiveWaves.filter(row => markerObserved(row)).length;
   const canaryBinaryLandings = positiveWaves.filter(row =>
     (row?.changedPaths ?? []).includes('canary') &&
     (row?.rows ?? []).find(entry => entry?.role === 'canary')?.result === 0x2eea02).length;
@@ -297,6 +297,10 @@ function classifyRunOutcome(report, events = []) {
   } else {
     evidenceStatus = 'unknown';
   }
+  // A phase-specific subclass is only verifiable when the phase could actually be
+  // reconstructed from retryPhases. On inconsistent telemetry the fallback covers
+  // all positive waves, so an earlier marker can masquerade as a later deviation.
+  if (phaseReconstruction === 'inconsistent' && evidenceStatus === 'verified') evidenceStatus = 'inferred';
 
   let firstUnjoinedWorkerIndex = null;
   let firstUnjoinedWorkerRole = null;

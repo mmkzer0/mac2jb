@@ -439,6 +439,7 @@ test('classifyRunOutcome separates worker stalls, heap drift, alias misses, and 
   });
   assert.equal(inconsistent.phaseReconstruction, 'inconsistent');
   assert.equal(inconsistent.terminalCause, 'canary-not-qualified');
+  assert.equal(inconsistent.evidenceStatus, 'inferred');
 
   // Same shape, but the failing phase itself contains the deviation.
   const repeatedDeviation = classifyRunOutcome({
