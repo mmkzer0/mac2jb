@@ -372,6 +372,7 @@ test('classifyRunOutcome separates worker stalls, heap drift, alias misses, and 
   // separate the two shapes.
   const positiveRow = (overrides = {}) => ({
     profile: 'positive', triggerAborted: false, canaryType: 1, changedPaths: [],
+    restored: true, allPending: true, receiveOrderMarginUs: 1000, preReleaseUsed: 0x28f0,
     rows: [{role: 'canary', result: 0}],
     ...overrides
   });
@@ -422,7 +423,22 @@ test('classifyRunOutcome separates worker stalls, heap drift, alias misses, and 
   assert.equal(repeated.terminalCause, 'canary-not-qualified');
   assert.equal(repeated.furthestStage, 'canary-reproduce');
   assert.equal(repeated.canaryMarkerHits, 1);
+  assert.equal(repeated.canaryTypeZeroWaves, 1);
   assert.equal(repeated.canaryUnabortedWaves, 31);
+  assert.equal(repeated.phaseReconstruction, 'ok');
+
+  // Inconsistent phase telemetry must fall back to all positive waves and say so.
+  // The probe message stays authoritative for new reports; the deviation-derived
+  // verdict only refines the legacy "uncertain overwrite" wording.
+  const inconsistent = classifyRunOutcome({
+    cases: [positiveRow({changedPaths: ['canary'], canaryType: 0}), positiveRow()],
+    retryPhases: [{profile: 'positive', waves: 1, complete: true, markerObserved: true, unsafe: false}],
+    markerSelected: true,
+    markerReproduced: false,
+    error: 'Error: Repeated positive phase found no marker in an unaborted phase; retain resources for recovery'
+  });
+  assert.equal(inconsistent.phaseReconstruction, 'inconsistent');
+  assert.equal(inconsistent.terminalCause, 'canary-not-qualified');
 
   // Same shape, but the failing phase itself contains the deviation.
   const repeatedDeviation = classifyRunOutcome({

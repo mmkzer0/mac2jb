@@ -224,7 +224,11 @@ function classifyRunOutcome(report, events = []) {
   const maxAttempts = report?.metadataAttempts ?? 4;
   const casesCount = report?.cases?.length ?? 0;
   const positiveWaves = (report?.cases ?? []).filter(row => row?.profile === 'positive');
-  const canaryMarkerHits = positiveWaves.filter(row => row?.canaryType === 0).length;
+  const canaryTypeZeroWaves = positiveWaves.filter(row => row?.canaryType === 0).length;
+  // A type-0 observation is weaker than a qualified marker hit: the marker also
+  // needs the qualified window and unchanged path set.
+  const canaryMarkerHits = positiveWaves.filter(row =>
+    hasWindow(row) && markerObserved(row)).length;
   const canaryBinaryLandings = positiveWaves.filter(row =>
     (row?.changedPaths ?? []).includes('canary') &&
     (row?.rows ?? []).find(entry => entry?.role === 'canary')?.result === 0x2eea02).length;
@@ -235,12 +239,18 @@ function classifyRunOutcome(report, events = []) {
   // would let an earlier marker hit masquerade as a later deviation.
   const positivePhases = (report?.retryPhases ?? []).filter(phase => phase?.profile === 'positive');
   let failingPhaseWaves = positiveWaves;
+  let phaseReconstruction = positivePhases.length ? 'ok' : 'absent';
   if (positivePhases.length) {
-    let cursor = 0;
-    for (const phase of positivePhases) {
-      const waves = Number(phase?.waves ?? 0);
-      failingPhaseWaves = positiveWaves.slice(cursor, cursor + waves);
-      cursor += waves;
+    const recorded = positivePhases.reduce((sum, phase) => sum + Number(phase?.waves ?? 0), 0);
+    if (recorded !== positiveWaves.length) {
+      phaseReconstruction = 'inconsistent';
+    } else {
+      let cursor = 0;
+      for (const phase of positivePhases) {
+        const waves = Number(phase?.waves ?? 0);
+        failingPhaseWaves = positiveWaves.slice(cursor, cursor + waves);
+        cursor += waves;
+      }
     }
   }
   const failingPhaseDeviation = failingPhaseWaves.some(row => (row?.changedPaths ?? []).length > 0);
@@ -318,8 +328,10 @@ function classifyRunOutcome(report, events = []) {
     selectedAlias,
     rangeCompleted,
     canaryMarkerHits,
+    canaryTypeZeroWaves,
     canaryBinaryLandings,
     canaryUnabortedWaves,
+    phaseReconstruction,
     firstUnjoinedWorkerIndex,
     firstUnjoinedWorkerRole,
     stalledWorkerIndex: firstUnjoinedWorkerIndex,
