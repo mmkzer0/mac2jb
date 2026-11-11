@@ -280,6 +280,20 @@ async function install(context, state, request) {
   const ownerBefore = await logicalRead(context, state, state.dataOffset, 0x78);
   verifyOwner(ownerBefore, state, context.storageSize);
   check(ownerBefore.readInt32LE(0x58) === 10, 'Unexpected native cache bucket count');
+  // Fixed bookkeeping only, no new gate: the S1 review showed the geometry is
+  // array = bucketCount * 0x90 with a 3-entry bucket, and shift = log2(block).
+  // +0x58 is the bucket count and +0x60 the shift; recording the product check
+  // keeps that mapping falsifiable on every future success.
+  const ownerArrayBytes = Number(ownerBefore.readBigUInt64LE(0x50));
+  const ownerBuckets = ownerBefore.readInt32LE(0x58);
+  const ownerShift = Number(ownerBefore.readBigUInt64LE(0x60));
+  const ownerBlock = Number(ownerBefore.readBigUInt64LE(0x28));
+  state.ownerGeometry = {
+    arrayBytes: ownerArrayBytes, buckets: ownerBuckets, shift: ownerShift, blockSize: ownerBlock,
+    bucketStride: ownerBuckets > 0 ? ownerArrayBytes / ownerBuckets : null,
+    consistent: ownerBuckets > 0 && ownerArrayBytes === 0x90 * ownerBuckets &&
+      ownerShift === Math.log2(ownerBlock)
+  };
   state.ownerBeforeHex = ownerBefore.toString('hex');
   await context.save();
   // Both fixed logical offsets now use nonnegative block indices. With count
