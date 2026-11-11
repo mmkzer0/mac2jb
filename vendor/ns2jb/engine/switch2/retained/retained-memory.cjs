@@ -216,6 +216,30 @@ async function install(context, state, request) {
   state.array = array;
   state.owner = owner;
   state.arrayLength = arrayLength;
+  // Pure decode of the bytes we already captured: which of the ten buckets use
+  // more than sub-slot 0, and what those slots currently claim. No extra read,
+  // no write, so this cannot perturb the lookup it describes.
+  const bucketBytes = 0x90, slotBytes = 0x30;
+  state.slotInventory = Array.from({length: Math.floor(arrayLength / bucketBytes)}, (_, bucket) =>
+    Array.from({length: bucketBytes / slotBytes}, (_, slot) => {
+      const at = bucket * bucketBytes + slot * slotBytes;
+      return {
+        bucket, slot,
+        offset: before.readBigUInt64LE(at).toString(),
+        size: before.readBigUInt64LE(at + 8).toString(),
+        valid: before[at + 0x10], writeBack: before[at + 0x11],
+        cached: before[at + 0x12], flushing: before[at + 0x13],
+        handle: before.readUInt32LE(at + 0x18),
+        address: before.readBigUInt64LE(at + 0x20).toString(),
+        memorySize: before.readBigUInt64LE(at + 0x28).toString()
+      };
+    }));
+  state.slotOccupancy = state.slotInventory.map(slots => ({
+    bucket: slots[0].bucket,
+    validSlots: slots.filter(slot => slot.valid === 1).length,
+    cachedSlots: slots.filter(slot => slot.cached === 1).length
+  }));
+  state.arraySha256 = require('node:crypto').createHash('sha256').update(before).digest('hex');
   state.dataOffset = dataBucket * 0x4000;
   state.dataEntryOffset = dataEntryOffset;
   state.scratchOffset = arrayLength - 0x18;
