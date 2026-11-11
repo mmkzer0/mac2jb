@@ -405,18 +405,39 @@ test('classifyRunOutcome separates worker stalls, heap drift, alias misses, and 
   assert.equal(noLanding.canaryUnabortedWaves, 3);
 
   // Second-phase variant observed on 2026-11-11 (switch2-YkJ1Bj): marker selected
-  // once, then 30 clean reproduction waves, then the repeated-phase failure.
+  // in phase 0, then 30 clean reproduction waves, then the repeated-phase failure.
+  // The verdict belongs to the failing phase, so an earlier marker hit must not be
+  // read as a later deviation.
   const repeated = classifyRunOutcome({
     cases: [positiveRow({changedPaths: ['canary'], canaryType: 0, rows: [{role: 'canary', result: 0}]}),
       ...Array.from({length: 30}, () => positiveRow())],
+    retryPhases: [
+      {profile: 'positive', waves: 1, complete: true, markerObserved: true, unsafe: false},
+      {profile: 'positive', waves: 30, complete: true, markerObserved: false, unsafe: true}
+    ],
     markerSelected: true,
     markerReproduced: false,
     error: 'Error: Repeated positive phase contains an uncertain overwrite; retain resources for recovery'
   });
-  assert.equal(repeated.terminalCause, 'positive-phase-uncertain');
+  assert.equal(repeated.terminalCause, 'canary-not-qualified');
   assert.equal(repeated.furthestStage, 'canary-reproduce');
   assert.equal(repeated.canaryMarkerHits, 1);
   assert.equal(repeated.canaryUnabortedWaves, 31);
+
+  // Same shape, but the failing phase itself contains the deviation.
+  const repeatedDeviation = classifyRunOutcome({
+    cases: [positiveRow({changedPaths: ['canary'], canaryType: 0, rows: [{role: 'canary', result: 0}]}),
+      ...Array.from({length: 29}, () => positiveRow()),
+      positiveRow({changedPaths: ['canary'], canaryType: null, rows: [{role: 'canary', result: 0x2eea02}]})],
+    retryPhases: [
+      {profile: 'positive', waves: 1, complete: true, markerObserved: true, unsafe: false},
+      {profile: 'positive', waves: 30, complete: true, markerObserved: false, unsafe: true}
+    ],
+    markerSelected: true,
+    markerReproduced: false,
+    error: 'Error: Repeated positive phase contains an uncertain overwrite; retain resources for recovery'
+  });
+  assert.equal(repeatedDeviation.terminalCause, 'positive-phase-uncertain');
 });
 
 test('qualifyOverlap accepts a fully overlapped wave and rejects each lifetime violation', () => {

@@ -229,6 +229,21 @@ function classifyRunOutcome(report, events = []) {
     (row?.changedPaths ?? []).includes('canary') &&
     (row?.rows ?? []).find(entry => entry?.role === 'canary')?.result === 0x2eea02).length;
   const canaryUnabortedWaves = positiveWaves.filter(row => !row?.triggerAborted).length;
+  // The terminal verdict belongs to the phase that actually failed. Phases are
+  // contiguous in `cases`, and `retryPhases` records their wave counts, so the
+  // last recorded positive phase is the failing one. Using every positive wave
+  // would let an earlier marker hit masquerade as a later deviation.
+  const positivePhases = (report?.retryPhases ?? []).filter(phase => phase?.profile === 'positive');
+  let failingPhaseWaves = positiveWaves;
+  if (positivePhases.length) {
+    let cursor = 0;
+    for (const phase of positivePhases) {
+      const waves = Number(phase?.waves ?? 0);
+      failingPhaseWaves = positiveWaves.slice(cursor, cursor + waves);
+      cursor += waves;
+    }
+  }
+  const failingPhaseDeviation = failingPhaseWaves.some(row => (row?.changedPaths ?? []).length > 0);
 
   let furthestStage = 'canary-select';
   if (addressCompleted && report?.ready && !error) furthestStage = 'completed';
@@ -252,8 +267,7 @@ function classifyRunOutcome(report, events = []) {
   else if (error.includes('Field copy did not qualify')) terminalCause = 'field-copy-not-qualified';
   else if (error.includes('Overwrite missed the qualified canary')) terminalCause = 'canary-overwrite-missed';
   else if (/positive phase contains an uncertain overwrite/i.test(error))
-    terminalCause = positiveWaves.some(row => (row?.changedPaths ?? []).length > 0)
-      ? 'positive-phase-uncertain' : 'canary-not-qualified';
+    terminalCause = failingPhaseDeviation ? 'positive-phase-uncertain' : 'canary-not-qualified';
   else if (rangeCompleted && linkCount > 0 && !addressCompleted) {
     terminalCause = 'address-plan-failed';
     evidenceStatus = error ? 'verified' : 'inferred';
