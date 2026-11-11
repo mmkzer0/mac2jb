@@ -364,4 +364,41 @@ test('classifyRunOutcome separates worker stalls, heap drift, alias misses, and 
   });
   assert.equal(initTimeout.furthestStage, 'init');
   assert.equal(initTimeout.terminalCause, 'transport-disconnected');
+
+  // Two real observed canary-phase failures (2026-11-11): one with shifted binary-path
+  // landings, one with no landing at all. Both must classify, and landing counters must
+  // separate the two shapes.
+  const positiveRow = (overrides = {}) => ({
+    profile: 'positive', triggerAborted: false, canaryType: 1, changedPaths: [],
+    rows: [{role: 'canary', result: 0}],
+    ...overrides
+  });
+  const shifted = classifyRunOutcome({
+    cases: [
+      positiveRow({changedPaths: ['canary'], canaryType: null,
+        rows: [{role: 'canary', result: 0x2eea02}]}),
+      positiveRow(),
+      positiveRow({triggerAborted: true})
+    ],
+    markerSelected: false,
+    markerReproduced: false,
+    error: 'Error: Positive phase contains an uncertain overwrite; retain resources for recovery'
+  });
+  assert.equal(shifted.terminalCause, 'positive-phase-uncertain');
+  assert.equal(shifted.evidenceStatus, 'verified');
+  assert.equal(shifted.furthestStage, 'canary-select');
+  assert.equal(shifted.canaryMarkerHits, 0);
+  assert.equal(shifted.canaryBinaryLandings, 1);
+  assert.equal(shifted.canaryUnabortedWaves, 2);
+
+  const noLanding = classifyRunOutcome({
+    cases: [positiveRow(), positiveRow(), positiveRow()],
+    markerSelected: false,
+    markerReproduced: false,
+    error: 'Error: Positive phase contains an uncertain overwrite; retain resources for recovery'
+  });
+  assert.equal(noLanding.terminalCause, 'positive-phase-uncertain');
+  assert.equal(noLanding.canaryBinaryLandings, 0);
+  assert.equal(noLanding.canaryMarkerHits, 0);
+  assert.equal(noLanding.canaryUnabortedWaves, 3);
 });

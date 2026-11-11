@@ -223,6 +223,12 @@ function classifyRunOutcome(report, events = []) {
   const aliasAttempts = report?.cacheAlias?.attempts?.length ?? 0;
   const maxAttempts = report?.metadataAttempts ?? 4;
   const casesCount = report?.cases?.length ?? 0;
+  const positiveWaves = (report?.cases ?? []).filter(row => row?.profile === 'positive');
+  const canaryMarkerHits = positiveWaves.filter(row => row?.canaryType === 0).length;
+  const canaryBinaryLandings = positiveWaves.filter(row =>
+    (row?.changedPaths ?? []).includes('canary') &&
+    (row?.rows ?? []).find(entry => entry?.role === 'canary')?.result === 0x2eea02).length;
+  const canaryUnabortedWaves = positiveWaves.filter(row => !row?.triggerAborted).length;
 
   let furthestStage = 'canary-select';
   if (addressCompleted && report?.ready && !error) furthestStage = 'completed';
@@ -245,6 +251,7 @@ function classifyRunOutcome(report, events = []) {
   else if (error.includes('Clean alias did not qualify')) terminalCause = 'alias-not-selected';
   else if (error.includes('Field copy did not qualify')) terminalCause = 'field-copy-not-qualified';
   else if (error.includes('Overwrite missed the qualified canary')) terminalCause = 'canary-overwrite-missed';
+  else if (error.includes('Positive phase contains an uncertain overwrite')) terminalCause = 'positive-phase-uncertain';
   else if (rangeCompleted && linkCount > 0 && !addressCompleted) {
     terminalCause = 'address-plan-failed';
     evidenceStatus = error ? 'verified' : 'inferred';
@@ -292,6 +299,9 @@ function classifyRunOutcome(report, events = []) {
     aliasAttempts,
     selectedAlias,
     rangeCompleted,
+    canaryMarkerHits,
+    canaryBinaryLandings,
+    canaryUnabortedWaves,
     firstUnjoinedWorkerIndex,
     firstUnjoinedWorkerRole,
     stalledWorkerIndex: firstUnjoinedWorkerIndex,
