@@ -259,6 +259,7 @@ async function main() {
     const storageSize = await domain.storageSize(s, storage);
     check(storageSize >= BigInt(probeReadSize), 'Own content is too small');
     report.storageSize = storageSize.toString();
+    report.storageHandle = storage;
     if (originalRom) check(await domain.storageSize(s, originalRom) === storageSize, 'Mounted RomFS size differs');
     async function nativeLinks(range) {
       const snapshots = [range, ...(range.fragmentation || [])];
