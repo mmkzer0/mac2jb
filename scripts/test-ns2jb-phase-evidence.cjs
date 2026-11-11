@@ -12,7 +12,7 @@ const {
   shouldRetryPositiveWave
 } = require(path.join(__dirname, '..', 'vendor/ns2jb/engine/switch2/memory/phase-evidence.cjs'));
 const {findNativeLinks} = require(path.join(__dirname, '..', 'vendor/ns2jb/engine/switch2/memory/native-links.cjs'));
-const {qualifyOverlap} = require(path.join(__dirname, '..', 'vendor/ns2jb/engine/switch2/memory/wave-overlap.cjs'));
+const {qualifyOverlap, qualifyExtentOverlap} = require(path.join(__dirname, '..', 'vendor/ns2jb/engine/switch2/memory/wave-overlap.cjs'));
 
 const row = overrides => ({
   restored: true, triggerAborted: false, allPending: true,
@@ -399,10 +399,24 @@ test('classifyRunOutcome separates worker stalls, heap drift, alias misses, and 
     markerReproduced: false,
     error: 'Error: Positive phase contains an uncertain overwrite; retain resources for recovery'
   });
-  assert.equal(noLanding.terminalCause, 'positive-phase-uncertain');
+  assert.equal(noLanding.terminalCause, 'canary-not-qualified');
   assert.equal(noLanding.canaryBinaryLandings, 0);
   assert.equal(noLanding.canaryMarkerHits, 0);
   assert.equal(noLanding.canaryUnabortedWaves, 3);
+
+  // Second-phase variant observed on 2026-11-11 (switch2-YkJ1Bj): marker selected
+  // once, then 30 clean reproduction waves, then the repeated-phase failure.
+  const repeated = classifyRunOutcome({
+    cases: [positiveRow({changedPaths: ['canary'], canaryType: 0, rows: [{role: 'canary', result: 0}]}),
+      ...Array.from({length: 30}, () => positiveRow())],
+    markerSelected: true,
+    markerReproduced: false,
+    error: 'Error: Repeated positive phase contains an uncertain overwrite; retain resources for recovery'
+  });
+  assert.equal(repeated.terminalCause, 'positive-phase-uncertain');
+  assert.equal(repeated.furthestStage, 'canary-reproduce');
+  assert.equal(repeated.canaryMarkerHits, 1);
+  assert.equal(repeated.canaryUnabortedWaves, 31);
 });
 
 test('qualifyOverlap accepts a fully overlapped wave and rejects each lifetime violation', () => {
@@ -438,18 +452,17 @@ test('qualifyOverlap accepts a fully overlapped wave and rejects each lifetime v
   assert.deepEqual(qualifyOverlap([{role: 'trigger', startUs: 0, endUs: 1}]),
     {qualified: false, mode: 'trigger-entry'});
 
-  // Documented divergence for the `isExtent && hasTmp` case: upstream's unified
-  // predicate accepts a held role that ends before trigger.endUs, while the
-  // inline probe predicate used for that case requires it to outlive the
-  // trigger. Keep this assertion so wiring the module in cannot silently weaken
-  // the extent qualification.
+  // Divergence pinning, now executable against the predicate the probe calls:
+  // `qualifyExtentOverlap` (used for `isExtent && hasTmp`) requires held roles to
+  // outlive trigger.endUs, while upstream's `qualifyOverlap` only requires
+  // `trigger.startUs < endUs`. Wiring the loose predicate into the extent branch
+  // now changes a function the probe imports, so this pair fails loudly.
   const extentRows = build();
   extentRows[2] = {...extentRows[2], endUs: 500}; // held role ends before trigger.endUs (800)
   assert.equal(qualifyOverlap(extentRows).qualified, true);
-  const strict = extentRows.filter(r => ['canary', 'filler0', 'filler1', 'guard0', 'guard1',
-    'commit', 'tail0', 'tail1', 'tail2', 'tail3'].includes(r.role))
-    .every(r => r.startUs < 200 && 800 < r.endUs);
-  assert.equal(strict, false);
+  assert.equal(qualifyExtentOverlap(extentRows), false);
+  assert.equal(qualifyExtentOverlap(build()), true);
+  assert.equal(qualifyExtentOverlap([{role: 'trigger', startUs: 0, endUs: 1}]), false);
 });
 
 test('shouldRetryPositiveWave retries only an unchanged owned canary', () => {

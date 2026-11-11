@@ -27,4 +27,19 @@ function qualifyOverlap(rows) {
   return {qualified: startedBeforeTrigger && throughTriggerEnd && heldLongEnough, mode};
 }
 
-module.exports = {qualifyOverlap, HELD_ROLES, THROUGH_ROLES};
+// The predicate the probe actually uses for the interleaved extent case
+// (`isExtent && hasTmp`): every held and through role must start before the
+// trigger and outlive its end, which is stricter than `qualifyOverlap` for the
+// held roles. Keep both here so the divergence is executable, and have the
+// probe call this function instead of an inline copy.
+function qualifyExtentOverlap(rows) {
+  const byRole = new Map(rows.map(row => [row.role, row]));
+  const trigger = byRole.get('trigger');
+  if (!trigger) return false;
+  return [...HELD_ROLES, ...THROUGH_ROLES].every(role => {
+    const row = byRole.get(role);
+    return Boolean(row) && row.startUs < trigger.startUs && trigger.endUs < row.endUs;
+  });
+}
+
+module.exports = {qualifyOverlap, qualifyExtentOverlap, HELD_ROLES, THROUGH_ROLES};

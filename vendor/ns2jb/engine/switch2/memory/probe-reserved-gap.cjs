@@ -12,6 +12,7 @@ const normalizedPath = require("./normalized-path.cjs");
 const {hasWindow, summarize, summarizeCopyStep, classifyAliasObservation, summarizeRangeLeak,
   shouldRetryPositiveWave} = require("./phase-evidence.cjs");
 const {packet, response} = require("../../shared/ipc.cjs");
+const {qualifyExtentOverlap} = require("./wave-overlap.cjs");
 const functions = require("../../shared/sdk-functions.json");
 
 async function main() {
@@ -22,6 +23,12 @@ async function main() {
   const waveAttempts = Number(process.env.NS2_WAVE_ATTEMPTS ?? 30);
   check(Number.isInteger(waveAttempts) && waveAttempts >= 1 && waveAttempts <= 200,
     'NS2_WAVE_ATTEMPTS must be an integer in 1..200');
+  // `upstream` = retry only an unchanged canary (fail closed on any deviation).
+  // `legacy` = retry any non-marker wave (keeps drawing fresh reservations).
+  // Each completed wave closes its group and reserves a new one, so a retry is a
+  // new placement draw, not a replay of the same geometry.
+  const retryPolicy = process.env.NS2_RETRY_POLICY ?? 'upstream';
+  check(['upstream', 'legacy'].includes(retryPolicy), 'NS2_RETRY_POLICY must be upstream or legacy');
   const plannerCycle = 0x28000;
   const canonicalPlanner = require('./cache-address-plan.cjs');
   const addressPlanner = (target, size) => require('./signed-cache-plan.cjs').plan(target, size, plannerCycle);
@@ -56,7 +63,9 @@ async function main() {
   const report = {session: live.session, scratch, canary, extent, markerOffset,
     probeReadSize, trialRange, cacheReadSize, fragmentCount, minimumCacheHeld,
     metadataAttempts, fieldCopies, waveAttempts, plannerCycle,
-    retryPolicy: {version: 2, positive: 'unchanged-only', waveAttempts, metadataAttempts, fieldCopies},
+    retryPolicy: {version: retryPolicy === 'upstream' ? 2 : 1, policy: retryPolicy,
+      positive: retryPolicy === 'upstream' ? 'unchanged-only' : 'blind',
+      waveAttempts, metadataAttempts, fieldCopies},
     started: new Date().toISOString(), cases: [],
     placementUncertain: false, canaryChanged: false, markerSelected: false,
     markerReproduced: false, stopped: false, retryPhases: []};
@@ -475,8 +484,7 @@ async function main() {
         restored: after[5] + (createPin ? 13616 : 0) === group.before[5], baseline: group.before[5], after: after[5],
         newPersistentBytes: createPin ? group.before[5] - after[5] : 0,
         allPending: (isExtent && hasTmp)
-          ? [...heldPaths, ...rows.filter(r => r.role.startsWith('tail') || r.role === 'commit')].every(
-              r => r.startUs < trigger.startUs && trigger.endUs < r.endUs)
+          ? qualifyExtentOverlap(rows)
           : [...heldPaths, ...rows.filter(r => r.role.startsWith('tail') || r.role === 'commit')].every(
               r => r.startUs < trigger.startUs) &&
             heldPaths.every(r => trigger.startUs < r.endUs) &&
@@ -544,10 +552,10 @@ async function main() {
           if (!hasWindow(row)) continue;
           if (profile === 'extent-present' && !row.selectedMarker) continue;
           if (profile === 'positive') {
-            // Upstream semantics: retry only an unchanged canary; a marker hit,
-            // a shifted (binary-path) landing, or any filler/guard deviation is
-            // the placement verdict and ends the phase immediately.
-            if (attempt < waveAttempts - 1 && shouldRetryPositiveWave(row)) continue;
+            const retry = retryPolicy === 'legacy'
+              ? !(row.canaryType === 0 && row.changedPaths.every(name => name === 'canary'))
+              : shouldRetryPositiveWave(row);
+            if (attempt < waveAttempts - 1 && retry) continue;
             break;
           } else if (profile === 'address-encoding-control') {
             if (row.canaryResult === 0 && row.canaryType === 1 &&

@@ -251,7 +251,9 @@ function classifyRunOutcome(report, events = []) {
   else if (error.includes('Clean alias did not qualify')) terminalCause = 'alias-not-selected';
   else if (error.includes('Field copy did not qualify')) terminalCause = 'field-copy-not-qualified';
   else if (error.includes('Overwrite missed the qualified canary')) terminalCause = 'canary-overwrite-missed';
-  else if (error.includes('Positive phase contains an uncertain overwrite')) terminalCause = 'positive-phase-uncertain';
+  else if (/positive phase contains an uncertain overwrite/i.test(error))
+    terminalCause = positiveWaves.some(row => (row?.changedPaths ?? []).length > 0)
+      ? 'positive-phase-uncertain' : 'canary-not-qualified';
   else if (rangeCompleted && linkCount > 0 && !addressCompleted) {
     terminalCause = 'address-plan-failed';
     evidenceStatus = error ? 'verified' : 'inferred';
@@ -312,10 +314,12 @@ function classifyRunOutcome(report, events = []) {
 
 function shouldRetryPositiveWave(row) {
   // Upstream semantics (cellenseres/astral v0.8.0): only an unchanged owned
-  // canary may be retried inside the same reservation. Any observed deviation
-  // (marker hit, shifted/binary-path landing, filler or guard change) is a
-  // placement verdict, not a race to retry: the reservation is created once per
-  // run, so further waves replay the same geometry.
+  // canary may be retried. Any observed deviation (marker hit, invalid-path
+  // landing, filler or guard change) ends the phase immediately.
+  // Note: every completed wave closes its group and reserves a new one, so a
+  // retry is a fresh placement draw, not a replay of the same geometry. This
+  // policy therefore trades placement draws for earlier fail-closed verdicts; it
+  // is a safety choice, not a yield improvement.
   return row?.canaryResult === 0 && row?.canaryType === 1 && (row?.changedPaths?.length ?? 0) === 0;
 }
 
