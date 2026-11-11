@@ -438,6 +438,16 @@ test('classifyRunOutcome separates worker stalls, heap drift, alias misses, and 
     error: 'Error: Repeated positive phase contains an uncertain overwrite; retain resources for recovery'
   });
   assert.equal(repeatedDeviation.terminalCause, 'positive-phase-uncertain');
+
+  // New probe wording for a phase that never observed a marker and no deviation.
+  const markerless = classifyRunOutcome({
+    cases: [positiveRow(), positiveRow()],
+    retryPhases: [{profile: 'positive', waves: 2, complete: true, markerObserved: false, unsafe: true}],
+    markerSelected: false,
+    markerReproduced: false,
+    error: 'Error: Positive phase found no marker in an unaborted phase; retain resources for recovery'
+  });
+  assert.equal(markerless.terminalCause, 'canary-not-qualified');
 });
 
 test('qualifyOverlap accepts a fully overlapped wave and rejects each lifetime violation', () => {

@@ -268,6 +268,8 @@ function classifyRunOutcome(report, events = []) {
   else if (error.includes('Overwrite missed the qualified canary')) terminalCause = 'canary-overwrite-missed';
   else if (/positive phase contains an uncertain overwrite/i.test(error))
     terminalCause = failingPhaseDeviation ? 'positive-phase-uncertain' : 'canary-not-qualified';
+  else if (/positive phase found no marker in an unaborted phase/i.test(error))
+    terminalCause = 'canary-not-qualified';
   else if (rangeCompleted && linkCount > 0 && !addressCompleted) {
     terminalCause = 'address-plan-failed';
     evidenceStatus = error ? 'verified' : 'inferred';

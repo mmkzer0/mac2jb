@@ -543,6 +543,15 @@ async function main() {
     }
 
     let positivePhases = 0;
+    // Distinguish a phase that observed a deviation from one that merely never
+    // saw a marker: both fail closed, but only the first is an unexpected
+    // overwrite. The last recorded positive phase is the one that just ran.
+    const lastPositivePhaseDeviation = () => {
+      const phase = report.retryPhases.at(-1);
+      if (!phase || phase.profile !== 'positive') return false;
+      const waves = (report.cases || []).filter(row => row.profile === 'positive').slice(-phase.waves);
+      return waves.some(row => (row.changedPaths ?? []).length > 0);
+    };
     async function retryWave(profile) {
       const firstCase = report.cases.length;
       let row, complete = false;
@@ -614,7 +623,9 @@ async function main() {
         await retryWave('positive');
         if (report.placementUncertain && !report.markerSelected) {
           await save();
-          throw Error('Positive phase contains an uncertain overwrite; retain resources for recovery');
+          throw Error(lastPositivePhaseDeviation()
+            ? 'Positive phase contains an uncertain overwrite; retain resources for recovery'
+            : 'Positive phase found no marker in an unaborted phase; retain resources for recovery');
         }
         // The locator already traversed and checked the full input extent.
         // Keep its allocation sequence intact through the directory controls.
@@ -623,7 +634,9 @@ async function main() {
           await retryWave('positive');
           if (report.placementUncertain && !report.markerReproduced) {
             await save();
-            throw Error('Repeated positive phase contains an uncertain overwrite; retain resources for recovery');
+            throw Error(lastPositivePhaseDeviation()
+              ? 'Repeated positive phase contains an uncertain overwrite; retain resources for recovery'
+              : 'Repeated positive phase found no marker in an unaborted phase; retain resources for recovery');
           }
           await checkExtent();
         }
