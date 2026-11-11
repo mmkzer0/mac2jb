@@ -14,5 +14,5 @@ command -v node >/dev/null || { echo 'Node.js 22+ must be installed locally; bun
 node -e 'if (Number(process.versions.node.split(".")[0])<22) process.exit(1)' || { echo 'Node >=22 required' >&2; exit 1; }
 node scripts/prepare-bootstrap.cjs --check
 node scripts/prepare-homebrew-apps.cjs --check
-node --test scripts/test-ns2jb-acquire.cjs scripts/test-ns2jb-capture.cjs scripts/test-ns2jb-phase-evidence.cjs
+node --test scripts/test-ns2jb-acquire.cjs scripts/test-ns2jb-capture.cjs scripts/test-ns2jb-phase-evidence.cjs scripts/test-ns2jb-cache-shape.cjs
 echo 'Bundled dependencies found. This does not verify USB device support or driver installation.'
