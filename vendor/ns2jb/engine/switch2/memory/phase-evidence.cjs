@@ -310,6 +310,15 @@ function classifyRunOutcome(report, events = []) {
   };
 }
 
+function shouldRetryPositiveWave(row) {
+  // Upstream semantics (cellenseres/astral v0.8.0): only an unchanged owned
+  // canary may be retried inside the same reservation. Any observed deviation
+  // (marker hit, shifted/binary-path landing, filler or guard change) is a
+  // placement verdict, not a race to retry: the reservation is created once per
+  // run, so further waves replay the same geometry.
+  return row?.canaryResult === 0 && row?.canaryType === 1 && (row?.changedPaths?.length ?? 0) === 0;
+}
+
 module.exports = {
   hasWindow,
   canaryChanged,
@@ -318,5 +327,6 @@ module.exports = {
   summarizeCopyStep,
   classifyAliasObservation,
   summarizeRangeLeak,
-  classifyRunOutcome
+  classifyRunOutcome,
+  shouldRetryPositiveWave
 };

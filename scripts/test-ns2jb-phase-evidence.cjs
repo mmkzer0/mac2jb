@@ -8,9 +8,11 @@ const {
   summarizeCopyStep,
   classifyAliasObservation,
   summarizeRangeLeak,
-  classifyRunOutcome
+  classifyRunOutcome,
+  shouldRetryPositiveWave
 } = require(path.join(__dirname, '..', 'vendor/ns2jb/engine/switch2/memory/phase-evidence.cjs'));
 const {findNativeLinks} = require(path.join(__dirname, '..', 'vendor/ns2jb/engine/switch2/memory/native-links.cjs'));
+const {qualifyOverlap} = require(path.join(__dirname, '..', 'vendor/ns2jb/engine/switch2/memory/wave-overlap.cjs'));
 
 const row = overrides => ({
   restored: true, triggerAborted: false, allPending: true,
@@ -401,4 +403,73 @@ test('classifyRunOutcome separates worker stalls, heap drift, alias misses, and 
   assert.equal(noLanding.canaryBinaryLandings, 0);
   assert.equal(noLanding.canaryMarkerHits, 0);
   assert.equal(noLanding.canaryUnabortedWaves, 3);
+});
+
+test('qualifyOverlap accepts a fully overlapped wave and rejects each lifetime violation', () => {
+  const held = ['canary', 'filler0', 'filler1', 'guard0', 'guard1'];
+  const through = ['commit', 'tail0', 'tail1', 'tail2', 'tail3'];
+  const build = ({start, end} = {}) => [
+    ...held.map(role => ({role, startUs: 100, endUs: 900})),
+    ...through.map(role => ({role, startUs: 100, endUs: 900})),
+    {role: 'trigger', startUs: (start ?? 200), endUs: (end ?? 800)},
+    {role: 'hole', startUs: 100, endUs: 900},
+    {role: 'preRelease', startUs: 100, endUs: 900},
+    {role: 'release', startUs: 100, endUs: 900},
+    {role: 'pin', startUs: 100, endUs: 900}
+  ];
+  assert.deepEqual(qualifyOverlap(build()), {qualified: true, mode: 'trigger-entry'});
+
+  // One held role starting after the trigger violates startedBeforeTrigger.
+  const lateHeld = build();
+  lateHeld[0] = {...lateHeld[0], startUs: 300};
+  assert.equal(qualifyOverlap(lateHeld).qualified, false);
+
+  // One held role ending exactly at the trigger start violates heldLongEnough (strict <).
+  const shortHeld = build();
+  shortHeld[1] = {...shortHeld[1], endUs: 200};
+  assert.equal(qualifyOverlap(shortHeld).qualified, false);
+
+  // A through role ending at the trigger end violates throughTriggerEnd.
+  const shortThrough = build();
+  shortThrough[7] = {...shortThrough[7], endUs: 800};
+  assert.equal(qualifyOverlap(shortThrough).qualified, false);
+
+  // Missing roles are never a qualified overlap.
+  assert.deepEqual(qualifyOverlap([{role: 'trigger', startUs: 0, endUs: 1}]),
+    {qualified: false, mode: 'trigger-entry'});
+
+  // Documented divergence for the `isExtent && hasTmp` case: upstream's unified
+  // predicate accepts a held role that ends before trigger.endUs, while the
+  // inline probe predicate used for that case requires it to outlive the
+  // trigger. Keep this assertion so wiring the module in cannot silently weaken
+  // the extent qualification.
+  const extentRows = build();
+  extentRows[2] = {...extentRows[2], endUs: 500}; // held role ends before trigger.endUs (800)
+  assert.equal(qualifyOverlap(extentRows).qualified, true);
+  const strict = extentRows.filter(r => ['canary', 'filler0', 'filler1', 'guard0', 'guard1',
+    'commit', 'tail0', 'tail1', 'tail2', 'tail3'].includes(r.role))
+    .every(r => r.startUs < 200 && 800 < r.endUs);
+  assert.equal(strict, false);
+});
+
+test('shouldRetryPositiveWave retries only an unchanged owned canary', () => {
+  // Unchanged owned canary: the only admissible retry.
+  assert.equal(shouldRetryPositiveWave({
+    canaryResult: 0, canaryType: 1, changedPaths: []
+  }), true);
+
+  // Marker hit ends the phase (accept).
+  assert.equal(shouldRetryPositiveWave({
+    canaryResult: 0, canaryType: 0, changedPaths: ['canary']
+  }), false);
+
+  // Shifted binary-path landing observed on 2026-11-11 ends the phase at once.
+  assert.equal(shouldRetryPositiveWave({
+    canaryResult: 0x2eea02, canaryType: null, changedPaths: ['canary']
+  }), false);
+
+  // A canary read error and a filler/guard deviation are verdicts, not retries.
+  assert.equal(shouldRetryPositiveWave({canaryResult: 0x202, canaryType: null, changedPaths: ['canary']}), false);
+  assert.equal(shouldRetryPositiveWave({canaryResult: 0, canaryType: 1, changedPaths: ['filler0']}), false);
+  assert.equal(shouldRetryPositiveWave({canaryResult: 0, canaryType: 1, changedPaths: ['canary', 'filler1']}), false);
 });

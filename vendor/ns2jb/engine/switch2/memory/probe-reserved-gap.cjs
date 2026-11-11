@@ -9,7 +9,8 @@ const {RunControl, StopRequested, reportWriter} = require("./run-control.cjs");
 const {packPages} = require("./session-tools.cjs");
 const {paths, pathPacket, pathPackets} = require("./paths.cjs");
 const normalizedPath = require("./normalized-path.cjs");
-const {hasWindow, summarize, summarizeCopyStep, classifyAliasObservation, summarizeRangeLeak} = require("./phase-evidence.cjs");
+const {hasWindow, summarize, summarizeCopyStep, classifyAliasObservation, summarizeRangeLeak,
+  shouldRetryPositiveWave} = require("./phase-evidence.cjs");
 const {packet, response} = require("../../shared/ipc.cjs");
 const functions = require("../../shared/sdk-functions.json");
 
@@ -18,7 +19,9 @@ async function main() {
   const probeReadSize = 0x180000, markerOffset = 0x2340;
   const trialRange = 0x600000, cacheReadSize = 0x200000, fragmentCount = 16;
   const minimumCacheHeld = 0x2810, metadataAttempts = 4, fieldCopies = 2;
-  const waveAttempts = 30;
+  const waveAttempts = Number(process.env.NS2_WAVE_ATTEMPTS ?? 30);
+  check(Number.isInteger(waveAttempts) && waveAttempts >= 1 && waveAttempts <= 200,
+    'NS2_WAVE_ATTEMPTS must be an integer in 1..200');
   const plannerCycle = 0x28000;
   const canonicalPlanner = require('./cache-address-plan.cjs');
   const addressPlanner = (target, size) => require('./signed-cache-plan.cjs').plan(target, size, plannerCycle);
@@ -53,6 +56,7 @@ async function main() {
   const report = {session: live.session, scratch, canary, extent, markerOffset,
     probeReadSize, trialRange, cacheReadSize, fragmentCount, minimumCacheHeld,
     metadataAttempts, fieldCopies, waveAttempts, plannerCycle,
+    retryPolicy: {version: 2, positive: 'unchanged-only', waveAttempts, metadataAttempts, fieldCopies},
     started: new Date().toISOString(), cases: [],
     placementUncertain: false, canaryChanged: false, markerSelected: false,
     markerReproduced: false, stopped: false, retryPhases: []};
@@ -540,8 +544,11 @@ async function main() {
           if (!hasWindow(row)) continue;
           if (profile === 'extent-present' && !row.selectedMarker) continue;
           if (profile === 'positive') {
-            const matched = row.canaryType === 0 && row.changedPaths.every(name => name === 'canary');
-            if (!matched && attempt < waveAttempts - 1) continue;
+            // Upstream semantics: retry only an unchanged canary; a marker hit,
+            // a shifted (binary-path) landing, or any filler/guard deviation is
+            // the placement verdict and ends the phase immediately.
+            if (attempt < waveAttempts - 1 && shouldRetryPositiveWave(row)) continue;
+            break;
           } else if (profile === 'address-encoding-control') {
             if (row.canaryResult === 0 && row.canaryType === 1 &&
                 row.changedPaths.every(name => ['filler0', 'filler1', 'guard0', 'guard1'].includes(name))) continue;
