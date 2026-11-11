@@ -267,6 +267,7 @@ function classifyRunOutcome(report, events = []) {
 
   let terminalCause = 'other-error';
   let evidenceStatus = 'verified';
+  let phaseDerived = false;
   if (report?.ready && addressCompleted && !error) terminalCause = 'ready';
   else if (error.includes('Native batch did not terminate')) terminalCause = 'native-worker-stall';
   else if (error.includes('General-heap allocation changed')) terminalCause = 'general-heap-drift';
@@ -276,9 +277,10 @@ function classifyRunOutcome(report, events = []) {
   else if (error.includes('Clean alias did not qualify')) terminalCause = 'alias-not-selected';
   else if (error.includes('Field copy did not qualify')) terminalCause = 'field-copy-not-qualified';
   else if (error.includes('Overwrite missed the qualified canary')) terminalCause = 'canary-overwrite-missed';
-  else if (/positive phase contains an uncertain overwrite/i.test(error))
+  else if (/positive phase contains an uncertain overwrite/i.test(error)) {
     terminalCause = failingPhaseDeviation ? 'positive-phase-uncertain' : 'canary-not-qualified';
-  else if (/positive phase found no marker in an unaborted phase/i.test(error))
+    phaseDerived = true;
+  } else if (/positive phase found no marker in an unaborted phase/i.test(error))
     terminalCause = 'canary-not-qualified';
   else if (rangeCompleted && linkCount > 0 && !addressCompleted) {
     terminalCause = 'address-plan-failed';
@@ -297,10 +299,10 @@ function classifyRunOutcome(report, events = []) {
   } else {
     evidenceStatus = 'unknown';
   }
-  // A phase-specific subclass is only verifiable when the phase could actually be
-  // reconstructed from retryPhases. On inconsistent telemetry the fallback covers
-  // all positive waves, so an earlier marker can masquerade as a later deviation.
-  if (phaseReconstruction === 'inconsistent' && evidenceStatus === 'verified') evidenceStatus = 'inferred';
+  // Only verdicts that depend on the phase reconstruction lose their verified
+  // status. An explicit worker timeout or transport error stays verified even
+  // when the canary-phase telemetry is inconsistent.
+  if (phaseReconstruction === 'inconsistent' && phaseDerived) evidenceStatus = 'inferred';
 
   let firstUnjoinedWorkerIndex = null;
   let firstUnjoinedWorkerRole = null;

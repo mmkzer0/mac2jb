@@ -428,8 +428,8 @@ test('classifyRunOutcome separates worker stalls, heap drift, alias misses, and 
   assert.equal(repeated.phaseReconstruction, 'ok');
 
   // Inconsistent phase telemetry must fall back to all positive waves and say so.
-  // The probe message stays authoritative for new reports; the deviation-derived
-  // verdict only refines the legacy "uncertain overwrite" wording.
+  // A message-based verdict stays verified; only the deviation-derived verdict
+  // depends on the reconstruction.
   const inconsistent = classifyRunOutcome({
     cases: [positiveRow({changedPaths: ['canary'], canaryType: 0}), positiveRow()],
     retryPhases: [{profile: 'positive', waves: 1, complete: true, markerObserved: true, unsafe: false}],
@@ -439,7 +439,30 @@ test('classifyRunOutcome separates worker stalls, heap drift, alias misses, and 
   });
   assert.equal(inconsistent.phaseReconstruction, 'inconsistent');
   assert.equal(inconsistent.terminalCause, 'canary-not-qualified');
-  assert.equal(inconsistent.evidenceStatus, 'inferred');
+  assert.equal(inconsistent.evidenceStatus, 'verified');
+
+  // The same inconsistent telemetry with the deviation-derived wording is inferred.
+  const inconsistentDerived = classifyRunOutcome({
+    cases: [positiveRow({changedPaths: ['canary'], canaryType: 0}), positiveRow()],
+    retryPhases: [{profile: 'positive', waves: 1, complete: true, markerObserved: true, unsafe: false}],
+    markerSelected: true,
+    markerReproduced: false,
+    error: 'Error: Repeated positive phase contains an uncertain overwrite; retain resources for recovery'
+  });
+  assert.equal(inconsistentDerived.phaseReconstruction, 'inconsistent');
+  assert.equal(inconsistentDerived.terminalCause, 'positive-phase-uncertain');
+  assert.equal(inconsistentDerived.evidenceStatus, 'inferred');
+
+  // An explicit worker timeout is independent of phase telemetry and stays verified.
+  const inconsistentStall = classifyRunOutcome({
+    cases: [positiveRow()],
+    retryPhases: [{profile: 'positive', waves: 9, complete: false, markerObserved: false, unsafe: true}],
+    error: 'Error: Native batch did not terminate; resources retained'
+  });
+  assert.equal(inconsistentStall.phaseReconstruction, 'inconsistent');
+  assert.equal(inconsistentStall.terminalCause, 'native-worker-stall');
+  assert.equal(inconsistentStall.evidenceStatus, 'verified');
+  assert.equal(inconsistentStall.canaryUnabortedWaves, 1);
 
   // Same shape, but the failing phase itself contains the deviation.
   const repeatedDeviation = classifyRunOutcome({
